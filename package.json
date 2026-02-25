@@ -1,15 +1,18 @@
-{
-  "name": "loglab",
-  "version": "1.0.0",
-  "description": "LogLab — Desktop log analysis tool with virtual scrolling, live tail, and visualization",
-  "main": "main.js",
-  "scripts": {
-    "start": "electron ."
-  },
-  "devDependencies": {
-    "electron": "^34.0.0"
-  },
-  "dependencies": {
-    "chokidar": "^4.0.0"
-  }
+﻿{
+    "name":  "loglab",
+    "version":  "1.0.0",
+    "description":  "LogLab â€” Desktop log analysis tool with virtual scrolling, live tail, and visualization",
+    "main":  "main.js",
+    "scripts":  {
+                    "start":  "electron ."
+                },
+    "devDependencies":  {
+                            "electron":  "^34.0.0"
+                        },
+    "dependencies":  {
+                         "chokidar":  "^4.0.0"
+                     },
+    "author":  "KCCS \u003cinfo@kccsonline.com\u003e (https://kccsonline.com)",
+    "license":  "UNLICENSED",
+    "homepage":  "https://kccsonline.com"
 }
