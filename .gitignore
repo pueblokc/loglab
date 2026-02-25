@@ -1,0 +1,10 @@
+node_modules/
+dist/
+out/
+*.db
+*.log
+.env
+.env.*
+thumbs.db
+Desktop.ini
+.DS_Store
