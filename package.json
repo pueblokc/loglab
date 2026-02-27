@@ -1,18 +1,43 @@
-﻿{
-    "name":  "loglab",
-    "version":  "1.0.0",
-    "description":  "LogLab â€” Desktop log analysis tool with virtual scrolling, live tail, and visualization",
-    "main":  "main.js",
-    "scripts":  {
-                    "start":  "electron ."
-                },
-    "devDependencies":  {
-                            "electron":  "^34.0.0"
-                        },
-    "dependencies":  {
-                         "chokidar":  "^4.0.0"
-                     },
-    "author":  "KCCS \u003cinfo@kccsonline.com\u003e (https://kccsonline.com)",
-    "license":  "UNLICENSED",
-    "homepage":  "https://kccsonline.com"
+{
+  "name": "loglab",
+  "version": "1.0.0",
+  "description": "LogLab — Desktop log analysis tool with virtual scrolling, live tail, and visualization",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "build:dir": "electron-builder --win --dir"
+  },
+  "build": {
+    "appId": "com.kccs.loglab",
+    "productName": "LogLab",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": ["nsis", "portable"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "fileAssociations": [
+      { "ext": "log", "name": "Log File", "role": "Viewer" },
+      { "ext": "txt", "name": "Text File", "role": "Viewer" }
+    ]
+  },
+  "devDependencies": {
+    "electron": "^34.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.0"
+  },
+  "author": "KCCS <info@kccsonline.com> (https://kccsonline.com)",
+  "license": "MIT",
+  "homepage": "https://github.com/pueblokc/loglab",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pueblokc/loglab.git"
+  }
 }

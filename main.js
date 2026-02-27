@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 const readline = require('readline');
+const { Readable } = require('stream');
 const chokidar = require('chokidar');
 
 // --- Config ---
@@ -18,9 +19,26 @@ let fileWatchers = new Map(); // path -> { watcher, size }
 // ============================================================
 // Preferences
 // ============================================================
+const DEFAULT_PREFS = {
+  fontSize: 12,
+  lineWrap: false,
+  theme: 'catppuccin-mocha',
+  maxLines: 500000,
+  autoTailOnOpen: false,
+  bookmarks: {},
+  recentFiles: [],
+};
+
 function loadPrefs() {
-  try { return fs.existsSync(PREFS_FILE) ? JSON.parse(fs.readFileSync(PREFS_FILE, 'utf8')) : {}; } catch { return {}; }
+  try {
+    if (fs.existsSync(PREFS_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(PREFS_FILE, 'utf8'));
+      return Object.assign({}, DEFAULT_PREFS, saved);
+    }
+  } catch { /* ignore */ }
+  return Object.assign({}, DEFAULT_PREFS);
 }
+
 function savePrefs(prefs) {
   try { fs.writeFileSync(PREFS_FILE, JSON.stringify(prefs, null, 2)); } catch { /* ignore */ }
 }
@@ -187,15 +205,33 @@ function parseLogLine(line, lineNum) {
   return entry;
 }
 
-// Read a log file - returns array of parsed entries
-async function readLogFile(filePath) {
+// Read a log file - handles plain text and gzip
+async function readLogFile(filePath, maxLines) {
+  const limit = maxLines || 500000;
   return new Promise((resolve, reject) => {
     const entries = [];
     let lineNum = 0;
-    const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+    let inputStream;
+    const isGzip = filePath.toLowerCase().endsWith('.gz');
+
+    try {
+      const fileStream = fs.createReadStream(filePath);
+      if (isGzip) {
+        const gunzip = zlib.createGunzip();
+        fileStream.pipe(gunzip);
+        inputStream = gunzip;
+      } else {
+        inputStream = fileStream;
+      }
+    } catch (err) {
+      return reject(err);
+    }
+
+    const rl = readline.createInterface({ input: inputStream, crlfDelay: Infinity });
 
     rl.on('line', (line) => {
+      if (lineNum >= limit) return; // respect max lines
       lineNum++;
       if (line.trim()) {
         entries.push(parseLogLine(line, lineNum));
@@ -203,6 +239,7 @@ async function readLogFile(filePath) {
     });
     rl.on('close', () => resolve(entries));
     rl.on('error', (err) => reject(err));
+    inputStream.on('error', (err) => reject(err));
   });
 }
 
@@ -262,6 +299,52 @@ function computeStats(entries) {
   return { levelCounts, hourlyData, topErrors, sources, totalLines: entries.length };
 }
 
+// Incrementally update stats with new entries (for tail mode)
+function updateStats(existingStats, newEntries) {
+  const s = existingStats;
+
+  for (const e of newEntries) {
+    if (s.levelCounts[e.level] !== undefined) s.levelCounts[e.level]++;
+
+    if (e.source) {
+      s.sources[e.source] = (s.sources[e.source] || 0) + 1;
+    }
+
+    if (e.timestamp) {
+      try {
+        const d = new Date(e.timestamp);
+        if (!isNaN(d.getTime())) {
+          const hourKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:00`;
+          // Update hourlyData in place
+          const existing = s.hourlyData.find(h => h.hour === hourKey);
+          if (existing) {
+            existing.count++;
+          } else {
+            s.hourlyData.push({ hour: hourKey, count: 1 });
+            s.hourlyData.sort((a, b) => a.hour.localeCompare(b.hour));
+          }
+        }
+      } catch { /* skip */ }
+    }
+
+    if (e.level === 'ERROR' || e.level === 'FATAL') {
+      const pattern = e.message.substring(0, 80).replace(/\d+/g, 'N').replace(/0x[0-9a-f]+/gi, '0xN');
+      const existing = s.topErrors.find(ep => ep.pattern === pattern);
+      if (existing) {
+        existing.count++;
+      } else {
+        s.topErrors.push({ pattern, count: 1 });
+      }
+      // Keep top 20 sorted
+      s.topErrors.sort((a, b) => b.count - a.count);
+      if (s.topErrors.length > 20) s.topErrors.length = 20;
+    }
+  }
+
+  s.totalLines += newEntries.length;
+  return s;
+}
+
 // ============================================================
 // Tail Mode
 // ============================================================
@@ -287,7 +370,7 @@ function startTailing(filePath, tabId) {
         stream.on('data', (chunk) => { newData += chunk; });
         stream.on('end', () => {
           const lines = newData.split(/\r?\n/).filter(l => l.trim());
-          const entries = lines.map((line, i) => parseLogLine(line, -1)); // -1 = tail line
+          const entries = lines.map((line) => parseLogLine(line, -1)); // -1 = tail line (renumbered in renderer)
           if (entries.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('tail-data', { tabId, entries });
           }
@@ -322,7 +405,7 @@ function watchDirectory(dirPath) {
     ignored: [/node_modules/, /\.git/],
   });
 
-  const logExts = ['.log', '.txt', '.syslog', '.err', '.out'];
+  const logExts = ['.log', '.txt', '.syslog', '.err', '.out', '.gz'];
   const logFiles = [];
 
   dirWatcher.on('add', (fp) => {
@@ -346,7 +429,8 @@ async function openFileDialog() {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile', 'multiSelections'],
     filters: [
-      { name: 'Log Files', extensions: ['log', 'txt', 'syslog', 'err', 'out', 'csv'] },
+      { name: 'Log Files', extensions: ['log', 'txt', 'syslog', 'err', 'out', 'csv', 'gz'] },
+      { name: 'Gzip Logs', extensions: ['gz'] },
       { name: 'All Files', extensions: ['*'] },
     ],
   });
@@ -394,9 +478,9 @@ function setupIPC() {
   ipcMain.handle('open-file-dialog', async () => openFileDialog());
   ipcMain.handle('open-dir-dialog', async () => openDirDialog());
 
-  ipcMain.handle('read-log-file', async (_e, filePath) => {
+  ipcMain.handle('read-log-file', async (_e, filePath, maxLines) => {
     try {
-      const entries = await readLogFile(filePath);
+      const entries = await readLogFile(filePath, maxLines);
       const stats = computeStats(entries);
       const fileStats = getFileStats(filePath);
       return { entries, stats, fileStats, name: path.basename(filePath), path: filePath };
@@ -416,6 +500,11 @@ function setupIPC() {
   ipcMain.handle('stop-tail', (_e, tabId) => {
     stopTailing(tabId);
     return true;
+  });
+
+  // Update stats incrementally (called from renderer after tail data arrives)
+  ipcMain.handle('update-stats', (_e, existingStats, newEntries) => {
+    return updateStats(existingStats, newEntries);
   });
 
   // Directory watching
@@ -454,6 +543,19 @@ function setupIPC() {
     prefs.recentFiles = prefs.recentFiles.slice(0, 20);
     savePrefs(prefs);
     return prefs.recentFiles;
+  });
+
+  // Settings / Preferences
+  ipcMain.handle('get-prefs', () => {
+    return loadPrefs();
+  });
+
+  ipcMain.handle('save-prefs', (_e, newPrefs) => {
+    const prefs = loadPrefs();
+    // Merge (preserve bookmarks and recentFiles from disk, update settings keys)
+    const merged = Object.assign({}, prefs, newPrefs);
+    savePrefs(merged);
+    return merged;
   });
 
   // Window controls

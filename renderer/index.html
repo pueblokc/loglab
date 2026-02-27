@@ -51,6 +51,7 @@
       <span id="search-count" class="search-count"></span>
       <button class="search-nav-btn" id="search-prev" title="Previous match">&uarr;</button>
       <button class="search-nav-btn" id="search-next" title="Next match">&darr;</button>
+      <button class="search-nav-btn" id="search-clear" title="Clear filter (Ctrl+L)">&times;</button>
     </div>
     <div class="tool-separator"></div>
     <div class="filter-group">
@@ -63,7 +64,7 @@
       <button class="level-btn" data-level="DEBUG">DBG</button>
     </div>
     <div class="tool-separator"></div>
-    <button class="tool-btn" id="btn-bookmark-toggle" title="Show Bookmarks">
+    <button class="tool-btn" id="btn-bookmark-toggle" title="Show Bookmarks (Ctrl+B)">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
     </button>
     <button class="tool-btn" id="btn-stats-toggle" title="Statistics Panel">
@@ -71,6 +72,9 @@
     </button>
     <button class="tool-btn" id="btn-timeline-toggle" title="Timeline View">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+    </button>
+    <button class="tool-btn" id="btn-settings-toggle" title="Settings">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
     </button>
     <div class="tool-separator"></div>
     <button class="tool-btn" id="btn-tail" title="Tail Mode (live follow)">
@@ -95,7 +99,7 @@
 
   <!-- ===== MAIN LAYOUT ===== -->
   <div id="main-layout">
-    <!-- Sidebar panels (stats, bookmarks) -->
+    <!-- Left Sidebar panels (stats, bookmarks) -->
     <div id="sidebar" class="hidden">
       <!-- Stats panel -->
       <div id="stats-panel" class="sidebar-panel hidden">
@@ -169,11 +173,15 @@
           </svg>
           <h1>LogLab</h1>
           <p>Drop log files here, or click <strong>Open</strong> to get started.</p>
-          <p class="welcome-hint">Supports syslog, application logs, web server logs, and more.</p>
+          <p class="welcome-hint">Supports syslog, application logs, web server logs, gzip compressed logs, and more.</p>
           <div class="welcome-shortcuts">
             <div><kbd>Ctrl+O</kbd> Open file</div>
             <div><kbd>Ctrl+F</kbd> Search</div>
             <div><kbd>Ctrl+B</kbd> Toggle bookmarks</div>
+            <div><kbd>Ctrl+G</kbd> Go to line</div>
+            <div><kbd>Ctrl+L</kbd> Clear filter</div>
+            <div><kbd>Ctrl+Shift+F</kbd> Advanced search</div>
+            <div><kbd>Ctrl+W</kbd> Close tab</div>
             <div><kbd>Ctrl+Shift+L</kbd> Show/hide window</div>
           </div>
           <div id="recent-files-section" class="hidden">
@@ -181,6 +189,74 @@
             <div id="recent-files-list"></div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Right Settings Panel (slide-in) -->
+    <div id="settings-panel" class="hidden">
+      <div class="sidebar-header">
+        <span>Settings</span>
+        <button class="sidebar-close" id="btn-settings-close">&times;</button>
+      </div>
+      <div class="sidebar-body settings-body">
+
+        <div class="settings-section">
+          <h3>Display</h3>
+
+          <div class="settings-row">
+            <label class="settings-label" for="pref-font-size">Font Size</label>
+            <div class="settings-control">
+              <input type="range" id="pref-font-size" min="10" max="18" step="1" value="12">
+              <span class="settings-value" id="pref-font-size-val">12px</span>
+            </div>
+          </div>
+
+          <div class="settings-row">
+            <label class="settings-label" for="pref-line-wrap">Line Wrap</label>
+            <div class="settings-control">
+              <label class="toggle-switch">
+                <input type="checkbox" id="pref-line-wrap">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-row">
+            <label class="settings-label" for="pref-theme">Theme</label>
+            <div class="settings-control">
+              <select id="pref-theme" class="settings-select">
+                <option value="catppuccin-mocha">Catppuccin Mocha</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Loading</h3>
+
+          <div class="settings-row">
+            <label class="settings-label" for="pref-max-lines">Max Lines Per File</label>
+            <div class="settings-control">
+              <input type="number" id="pref-max-lines" min="1000" max="5000000" step="10000" value="500000" class="settings-number">
+            </div>
+          </div>
+
+          <div class="settings-row">
+            <label class="settings-label" for="pref-auto-tail">Auto-Tail on Open</label>
+            <div class="settings-control">
+              <label class="toggle-switch">
+                <input type="checkbox" id="pref-auto-tail">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <button class="settings-save-btn" id="btn-save-settings">Save Settings</button>
+          <div class="settings-saved-msg hidden" id="settings-saved-msg">Settings saved.</div>
+        </div>
+
       </div>
     </div>
   </div>
@@ -194,13 +270,91 @@
     <span id="status-encoding"></span>
   </div>
 
+  <!-- ===== KCCS BRANDING FOOTER ===== -->
+  <div id="kccs-footer">
+    <span class="kccs-footer-logo">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="16" height="16" style="vertical-align:middle">
+        <rect x="10" y="8" width="44" height="32" rx="3" fill="#1e1e2e" stroke="#89b4fa" stroke-width="2"/>
+        <rect x="14" y="12" width="36" height="24" rx="1" fill="#181825"/>
+        <line x1="16" y1="20" x2="34" y2="20" stroke="#a6e3a1" stroke-width="2" stroke-linecap="round"/>
+        <line x1="16" y1="25" x2="28" y2="25" stroke="#89b4fa" stroke-width="2" stroke-linecap="round"/>
+        <line x1="16" y1="30" x2="40" y2="30" stroke="#f38ba8" stroke-width="2" stroke-linecap="round"/>
+        <ellipse cx="25" cy="16" rx="5" ry="3" fill="#11111b" stroke="#cdd6f4" stroke-width="1"/>
+        <ellipse cx="39" cy="16" rx="5" ry="3" fill="#11111b" stroke="#cdd6f4" stroke-width="1"/>
+        <line x1="30" y1="16" x2="34" y2="16" stroke="#cdd6f4" stroke-width="1"/>
+      </svg>
+    </span>
+    <span>&copy; <span id="kccs-year"></span> KCCS</span>
+    <span>&middot;</span>
+    <a href="https://kccsonline.com" target="_blank">kccsonline.com</a>
+  </div>
+
   <!-- ===== EXPORT MENU ===== -->
   <div id="export-menu" class="dropdown-menu hidden">
     <button class="dropdown-item" data-format="csv">Export as CSV</button>
     <button class="dropdown-item" data-format="json">Export as JSON</button>
   </div>
 
+  <!-- ===== GO TO LINE MODAL ===== -->
+  <div id="modal-overlay" class="hidden">
+    <div id="goto-modal" class="modal hidden">
+      <div class="modal-title">Go to Line</div>
+      <div class="modal-body">
+        <input type="number" id="goto-line-input" placeholder="Line number..." min="1" class="modal-input">
+        <div class="modal-hint" id="goto-line-hint"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" id="goto-line-ok">Go</button>
+        <button class="modal-btn" id="goto-line-cancel">Cancel</button>
+      </div>
+    </div>
+
+    <!-- ===== ADVANCED SEARCH MODAL ===== -->
+    <div id="advsearch-modal" class="modal hidden">
+      <div class="modal-title">Advanced Search</div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label class="modal-label">Search text</label>
+          <input type="text" id="advsearch-text" placeholder="Search pattern..." class="modal-input" spellcheck="false">
+        </div>
+        <div class="modal-field modal-row">
+          <label class="modal-check"><input type="checkbox" id="advsearch-regex"> Regex</label>
+          <label class="modal-check"><input type="checkbox" id="advsearch-case"> Case sensitive</label>
+        </div>
+        <div class="modal-field">
+          <label class="modal-label">Date range</label>
+          <div class="modal-date-row">
+            <input type="datetime-local" id="advsearch-from" class="modal-input modal-date" title="From date/time">
+            <span class="modal-date-sep">to</span>
+            <input type="datetime-local" id="advsearch-to" class="modal-input modal-date" title="To date/time">
+          </div>
+        </div>
+        <div class="modal-field">
+          <label class="modal-label">Level filter</label>
+          <select id="advsearch-level" class="settings-select">
+            <option value="all">All Levels</option>
+            <option value="FATAL">FATAL</option>
+            <option value="ERROR">ERROR</option>
+            <option value="WARN">WARN</option>
+            <option value="INFO">INFO</option>
+            <option value="DEBUG">DEBUG</option>
+          </select>
+        </div>
+        <div class="modal-field">
+          <label class="modal-label">Source filter</label>
+          <input type="text" id="advsearch-source" placeholder="Source name (optional)" class="modal-input" spellcheck="false">
+        </div>
+        <div id="advsearch-result-count" class="modal-hint"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" id="advsearch-apply">Apply Filter</button>
+        <button class="modal-btn modal-btn-secondary" id="advsearch-reset">Reset</button>
+        <button class="modal-btn" id="advsearch-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
-<script src="kccs-branding.js"></script>
+  <script>document.getElementById('kccs-year').textContent = new Date().getFullYear();</script>
 </body>
 </html>

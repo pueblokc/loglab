@@ -17,9 +17,15 @@
     levelFilter: 'all',
     autoScroll: false,
     sidebarPanel: null,  // 'stats' | 'bookmarks' | null
+    settingsOpen: false,
     timelineVisible: false,
+    lineWrap: false,
+    fontSize: 12,
+    // Advanced search active filter
+    advSearch: null,  // { text, regex, caseSensitive, fromDate, toDate, level, source }
   };
 
+  let prefs = {};
   let tabIdCounter = 0;
 
   // ---- DOM refs ----
@@ -33,10 +39,12 @@
     searchRegex: $('#search-regex'),
     searchCase: $('#search-case'),
     searchCount: $('#search-count'),
+    searchClear: $('#search-clear'),
     tabsContainer: $('#tabs-container'),
     sidebar: $('#sidebar'),
     statsPanel: $('#stats-panel'),
     bookmarksPanel: $('#bookmarks-panel'),
+    settingsPanel: $('#settings-panel'),
     logArea: $('#log-area'),
     logViewer: $('#log-viewer'),
     scrollContainer: $('#log-scroll-container'),
@@ -59,13 +67,35 @@
     bookmarksBody: $('#bookmarks-body'),
     recentSection: $('#recent-files-section'),
     recentList: $('#recent-files-list'),
+    // Settings controls
+    prefFontSize: $('#pref-font-size'),
+    prefFontSizeVal: $('#pref-font-size-val'),
+    prefLineWrap: $('#pref-line-wrap'),
+    prefTheme: $('#pref-theme'),
+    prefMaxLines: $('#pref-max-lines'),
+    prefAutoTail: $('#pref-auto-tail'),
+    settingsSavedMsg: $('#settings-saved-msg'),
+    // Modals
+    modalOverlay: $('#modal-overlay'),
+    gotoModal: $('#goto-modal'),
+    gotoLineInput: $('#goto-line-input'),
+    gotoLineHint: $('#goto-line-hint'),
+    advsearchModal: $('#advsearch-modal'),
+    advsearchText: $('#advsearch-text'),
+    advsearchRegex: $('#advsearch-regex'),
+    advsearchCase: $('#advsearch-case'),
+    advsearchFrom: $('#advsearch-from'),
+    advsearchTo: $('#advsearch-to'),
+    advsearchLevel: $('#advsearch-level'),
+    advsearchSource: $('#advsearch-source'),
+    advsearchResultCount: $('#advsearch-result-count'),
   };
 
   // ============================================================
   // Virtual Scroll Engine
   // ============================================================
   const LINE_HEIGHT = 20;
-  const BUFFER_LINES = 20; // extra lines above/below viewport
+  const BUFFER_LINES = 25; // extra lines above/below viewport
 
   function getActiveTab() {
     return state.tabs.find(t => t.id === state.activeTabId);
@@ -78,8 +108,10 @@
     if (!tab) return { start: 0, end: 0 };
 
     const totalLines = tab.filteredEntries.length;
-    const start = Math.max(0, Math.floor(scrollTop / LINE_HEIGHT) - BUFFER_LINES);
-    const end = Math.min(totalLines, Math.ceil((scrollTop + viewHeight) / LINE_HEIGHT) + BUFFER_LINES);
+    // In wrap mode we can't pre-compute heights easily, so render more conservatively
+    const lineH = state.lineWrap ? LINE_HEIGHT : LINE_HEIGHT;
+    const start = Math.max(0, Math.floor(scrollTop / lineH) - BUFFER_LINES);
+    const end = Math.min(totalLines, Math.ceil((scrollTop + viewHeight) / lineH) + BUFFER_LINES);
     return { start, end };
   }
 
@@ -92,6 +124,10 @@
     }
 
     const entries = tab.filteredEntries;
+
+    // In wrap mode the spacer height can't be pre-computed per-line accurately,
+    // so we use a rough estimate and rely on the viewport being positioned at top:0
+    // with the spacer providing scroll room.
     const totalHeight = entries.length * LINE_HEIGHT;
     dom.spacer.style.height = totalHeight + 'px';
 
@@ -112,6 +148,7 @@
   function createLogLine(entry, idx) {
     const div = document.createElement('div');
     div.className = 'log-line';
+    if (state.lineWrap) div.classList.add('wrap-mode');
     div.dataset.idx = idx;
     div.dataset.lineNum = entry.line;
 
@@ -141,7 +178,7 @@
 
     const bmBtn = document.createElement('button');
     bmBtn.className = 'bookmark-btn';
-    bmBtn.innerHTML = '&#9654;'; // triangle
+    bmBtn.innerHTML = '&#9654;';
     bmBtn.title = 'Toggle bookmark';
     bmBtn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -194,15 +231,19 @@
       text = text.replace(pat, `<span class="level-tag level-${entry.level}">$1</span>`);
     }
 
-    // Highlight search matches
-    if (state.searchQuery) {
+    // Highlight search matches (both quick search and advanced search text)
+    const searchQ = state.advSearch ? state.advSearch.text : state.searchQuery;
+    const searchIsRegex = state.advSearch ? state.advSearch.regex : state.searchRegex;
+    const searchIsCase = state.advSearch ? state.advSearch.caseSensitive : state.searchCaseSensitive;
+
+    if (searchQ) {
       try {
         let searchRe;
-        if (state.searchRegex) {
-          searchRe = new RegExp(`(${state.searchQuery})`, state.searchCaseSensitive ? 'g' : 'gi');
+        if (searchIsRegex) {
+          searchRe = new RegExp(`(${searchQ})`, searchIsCase ? 'g' : 'gi');
         } else {
-          const escaped = escapeRegex(state.searchQuery);
-          searchRe = new RegExp(`(${escaped})`, state.searchCaseSensitive ? 'g' : 'gi');
+          const escaped = escapeRegex(searchQ);
+          searchRe = new RegExp(`(${escaped})`, searchIsCase ? 'g' : 'gi');
         }
         text = text.replace(searchRe, '<span class="search-highlight">$1</span>');
       } catch { /* invalid regex */ }
@@ -220,18 +261,55 @@
 
     let entries = tab.entries;
 
-    // Level filter
-    if (state.levelFilter !== 'all') {
-      entries = entries.filter(e => e.level === state.levelFilter);
+    // Level filter (toolbar level buttons or advanced search level)
+    const levelFilter = (state.advSearch && state.advSearch.level !== 'all')
+      ? state.advSearch.level
+      : state.levelFilter;
+
+    if (levelFilter !== 'all') {
+      entries = entries.filter(e => e.level === levelFilter);
     }
 
-    // Search filter (don't filter, just mark matches)
+    // Advanced search filters
+    if (state.advSearch) {
+      const adv = state.advSearch;
+
+      // Text filter
+      if (adv.text) {
+        try {
+          let re;
+          if (adv.regex) {
+            re = new RegExp(adv.text, adv.caseSensitive ? '' : 'i');
+          } else {
+            re = new RegExp(escapeRegex(adv.text), adv.caseSensitive ? '' : 'i');
+          }
+          entries = entries.filter(e => re.test(e.raw));
+        } catch { /* bad regex, skip */ }
+      }
+
+      // Date range filter
+      if (adv.fromDate || adv.toDate) {
+        const from = adv.fromDate ? new Date(adv.fromDate).getTime() : 0;
+        const to = adv.toDate ? new Date(adv.toDate).getTime() : Infinity;
+        entries = entries.filter(e => {
+          if (!e.timestamp) return true; // keep lines without timestamps
+          const t = new Date(e.timestamp).getTime();
+          return !isNaN(t) && t >= from && t <= to;
+        });
+      }
+
+      // Source filter
+      if (adv.source) {
+        const srcPattern = new RegExp(escapeRegex(adv.source), 'i');
+        entries = entries.filter(e => srcPattern.test(e.source));
+      }
+    }
+
     tab.filteredEntries = entries;
 
-    // Compute search matches
+    // Compute search matches (quick search bar, not advanced)
     computeSearchMatches();
 
-    // Update display
     renderLogLines();
     updateStatusBar();
     updateTimeline();
@@ -242,7 +320,7 @@
     state.searchCurrentIdx = -1;
 
     const tab = getActiveTab();
-    if (!tab || !state.searchQuery) {
+    if (!tab || !state.searchQuery || state.advSearch) {
       dom.searchCount.textContent = '';
       return;
     }
@@ -284,7 +362,6 @@
 
     dom.searchCount.textContent = `${state.searchCurrentIdx + 1}/${state.searchMatches.length}`;
 
-    // Scroll to match
     const matchIdx = state.searchMatches[state.searchCurrentIdx];
     scrollToLine(matchIdx);
     renderLogLines();
@@ -293,6 +370,15 @@
   function scrollToLine(idx) {
     const scrollTop = idx * LINE_HEIGHT - dom.logViewer.clientHeight / 2;
     dom.scrollContainer.scrollTop = Math.max(0, scrollTop);
+  }
+
+  function clearSearch() {
+    state.searchQuery = '';
+    dom.searchInput.value = '';
+    dom.searchCount.textContent = '';
+    state.searchMatches = [];
+    state.searchCurrentIdx = -1;
+    renderLogLines();
   }
 
   // ============================================================
@@ -337,7 +423,6 @@
   }
 
   function switchTab(id) {
-    // Save scroll position of current tab
     const current = getActiveTab();
     if (current) current.scrollPos = dom.scrollContainer.scrollTop;
 
@@ -348,10 +433,8 @@
     dom.titleFile.textContent = tab.path || tab.name;
     showWelcome(false);
 
-    // Update tail status
     dom.statusTail.classList.toggle('hidden', !tab.tailing);
 
-    // Restore scroll position
     applyFilters();
     renderTabs();
 
@@ -360,7 +443,6 @@
       renderLogLines();
     });
 
-    // Update stats if sidebar visible
     if (state.sidebarPanel === 'stats') renderStats();
     if (state.sidebarPanel === 'bookmarks') renderBookmarks();
   }
@@ -393,19 +475,17 @@
   async function loadFile(filePath) {
     dom.statusText.textContent = `Loading ${filePath}...`;
 
-    const result = await window.loglab.readLogFile(filePath);
+    const maxLines = prefs.maxLines || 500000;
+    const result = await window.loglab.readLogFile(filePath, maxLines);
     if (result.error) {
       dom.statusText.textContent = `Error: ${result.error}`;
       return;
     }
 
-    // Add to recent files
     window.loglab.addRecentFile(filePath);
 
-    // Create or reuse tab
     let tab = state.tabs.find(t => t.path === filePath);
     if (tab) {
-      // Reload into existing tab
       tab.entries = result.entries;
       tab.stats = result.stats;
       tab.filteredEntries = result.entries;
@@ -417,16 +497,17 @@
       tab.filteredEntries = result.entries;
     }
 
-    // Load bookmarks
     const bookmarks = await window.loglab.getBookmarks(filePath);
     tab.bookmarks = bookmarks || [];
 
     applyFilters();
     dom.statusText.textContent = `Loaded ${result.name} (${formatSize(result.fileStats?.size || 0)})`;
-    dom.statusEncoding.textContent = 'UTF-8';
+    dom.statusEncoding.textContent = filePath.toLowerCase().endsWith('.gz') ? 'gzip/UTF-8' : 'UTF-8';
 
-    // Auto-scroll to bottom if enabled
-    if (state.autoScroll) {
+    // Auto-tail on open if pref enabled
+    if (prefs.autoTailOnOpen && !tab.tailing) {
+      await toggleTail();
+    } else if (state.autoScroll) {
       scrollToLine(tab.filteredEntries.length - 1);
     }
   }
@@ -470,30 +551,49 @@
   }
 
   // Handle incoming tail data
-  window.loglab.onTailData(({ tabId, entries }) => {
+  window.loglab.onTailData(async ({ tabId, entries }) => {
     const tab = state.tabs.find(t => t.id === tabId);
     if (!tab) return;
 
-    // Assign line numbers
+    // Assign real line numbers
     const startLine = tab.entries.length + 1;
     entries.forEach((e, i) => { e.line = startLine + i; });
 
     tab.entries.push(...entries);
 
-    // Re-filter
-    if (state.levelFilter !== 'all') {
-      const newFiltered = entries.filter(e => e.level === state.levelFilter);
-      tab.filteredEntries.push(...newFiltered);
-    } else {
-      tab.filteredEntries.push(...entries);
+    // Re-filter new entries and add to filteredEntries
+    let newFiltered = entries;
+    const levelFilter = (state.advSearch && state.advSearch.level !== 'all')
+      ? state.advSearch.level
+      : state.levelFilter;
+
+    if (levelFilter !== 'all') {
+      newFiltered = newFiltered.filter(e => e.level === levelFilter);
     }
 
-    // Update stats
-    if (tab.stats) {
-      for (const e of entries) {
-        if (tab.stats.levelCounts[e.level] !== undefined) tab.stats.levelCounts[e.level]++;
+    // Apply advanced search filter if active
+    if (state.advSearch) {
+      const adv = state.advSearch;
+      if (adv.text) {
+        try {
+          let re = adv.regex
+            ? new RegExp(adv.text, adv.caseSensitive ? '' : 'i')
+            : new RegExp(escapeRegex(adv.text), adv.caseSensitive ? '' : 'i');
+          newFiltered = newFiltered.filter(e => re.test(e.raw));
+        } catch { /* skip */ }
       }
-      tab.stats.totalLines = tab.entries.length;
+      if (adv.source) {
+        const srcPattern = new RegExp(escapeRegex(adv.source), 'i');
+        newFiltered = newFiltered.filter(e => srcPattern.test(e.source));
+      }
+    }
+
+    tab.filteredEntries.push(...newFiltered);
+
+    // Update stats incrementally (both level counts AND hourly/error patterns)
+    if (tab.stats) {
+      // Do incremental update in main process to keep logic centralized
+      tab.stats = await window.loglab.updateStats(tab.stats, entries);
     }
 
     if (tab.id === state.activeTabId) {
@@ -511,7 +611,6 @@
   // Handle directory file discovery
   window.loglab.onDirFileFound(({ path: fp, name }) => {
     dom.statusText.textContent = `Found: ${name}`;
-    // Auto-open the first few
     if (state.tabs.length < 5) loadFile(fp);
   });
 
@@ -530,7 +629,6 @@
       tab.bookmarks.sort((a, b) => a - b);
     }
 
-    // Save
     if (tab.path) window.loglab.setBookmarks(tab.path, tab.bookmarks);
 
     renderLogLines();
@@ -584,7 +682,6 @@
     const s = tab.stats;
     const total = Object.values(s.levelCounts).reduce((a, b) => a + b, 0) || 1;
 
-    // Level chart
     const levels = [
       { key: 'FATAL', label: 'FATAL', cls: 'fatal', color: 'var(--maroon)' },
       { key: 'ERROR', label: 'ERROR', cls: 'error', color: 'var(--red)' },
@@ -603,8 +700,7 @@
       </div>`;
     }).join('');
 
-    // Hourly chart
-    if (s.hourlyData.length > 0) {
+    if (s.hourlyData && s.hourlyData.length > 0) {
       const maxCount = Math.max(...s.hourlyData.map(h => h.count)) || 1;
       dom.hourlyChart.innerHTML = s.hourlyData.map(h => {
         const pct = (h.count / maxCount * 100);
@@ -616,8 +712,7 @@
       dom.hourlyChart.innerHTML = '<div class="empty-state" style="height:100%;display:flex;align-items:center;justify-content:center">No timestamp data</div>';
     }
 
-    // Error patterns
-    if (s.topErrors.length > 0) {
+    if (s.topErrors && s.topErrors.length > 0) {
       dom.errorPatterns.innerHTML = s.topErrors.map(e =>
         `<div class="error-pattern-item">
           <span class="error-pattern-count">${e.count}</span>
@@ -628,8 +723,7 @@
       dom.errorPatterns.innerHTML = '<div class="empty-state">No errors found</div>';
     }
 
-    // Sources
-    const srcEntries = Object.entries(s.sources).sort((a, b) => b[1] - a[1]).slice(0, 30);
+    const srcEntries = Object.entries(s.sources || {}).sort((a, b) => b[1] - a[1]).slice(0, 30);
     if (srcEntries.length > 0) {
       dom.sourceList.innerHTML = srcEntries.map(([name, count]) =>
         `<div class="source-item">
@@ -649,7 +743,7 @@
     if (!state.timelineVisible) return;
 
     const tab = getActiveTab();
-    if (!tab || !tab.stats || tab.stats.hourlyData.length === 0) return;
+    if (!tab || !tab.stats || !tab.stats.hourlyData || tab.stats.hourlyData.length === 0) return;
 
     const canvas = dom.timelineCanvas;
     const ctx = canvas.getContext('2d');
@@ -663,7 +757,6 @@
     const maxCount = Math.max(...data.map(h => h.count)) || 1;
     const barWidth = Math.max(2, canvas.width / data.length - 1);
 
-    // Color based on density
     data.forEach((h, i) => {
       const x = (i / data.length) * canvas.width;
       const height = (h.count / maxCount) * (canvas.height - 8);
@@ -676,7 +769,6 @@
       ctx.fillRect(x, canvas.height - height - 4, barWidth, height);
     });
 
-    // Draw labels
     ctx.fillStyle = '#6c7086';
     ctx.font = '9px Consolas';
     if (data.length > 0) {
@@ -718,7 +810,6 @@
 
   function toggleSidebar(panel) {
     if (state.sidebarPanel === panel) {
-      // Close
       state.sidebarPanel = null;
       dom.sidebar.classList.add('hidden');
       dom.statsPanel.classList.add('hidden');
@@ -738,11 +829,224 @@
     }
   }
 
+  function toggleSettings() {
+    state.settingsOpen = !state.settingsOpen;
+    dom.settingsPanel.classList.toggle('hidden', !state.settingsOpen);
+    $('#btn-settings-toggle').classList.toggle('active', state.settingsOpen);
+  }
+
   function toggleTimeline() {
     state.timelineVisible = !state.timelineVisible;
     dom.timelineBar.classList.toggle('hidden', !state.timelineVisible);
     $('#btn-timeline-toggle').classList.toggle('active', state.timelineVisible);
     if (state.timelineVisible) updateTimeline();
+  }
+
+  // ============================================================
+  // Settings
+  // ============================================================
+  async function loadSettings() {
+    prefs = await window.loglab.getPrefs();
+
+    // Apply to UI controls
+    const fs = prefs.fontSize || 12;
+    dom.prefFontSize.value = fs;
+    dom.prefFontSizeVal.textContent = fs + 'px';
+    dom.prefLineWrap.checked = !!prefs.lineWrap;
+    dom.prefTheme.value = prefs.theme || 'catppuccin-mocha';
+    dom.prefMaxLines.value = prefs.maxLines || 500000;
+    dom.prefAutoTail.checked = !!prefs.autoTailOnOpen;
+
+    // Apply immediately
+    applyFontSize(fs);
+    applyLineWrap(!!prefs.lineWrap);
+  }
+
+  function applyFontSize(size) {
+    state.fontSize = size;
+    dom.logViewer.style.fontSize = size + 'px';
+  }
+
+  function applyLineWrap(wrap) {
+    state.lineWrap = wrap;
+    renderLogLines();
+  }
+
+  async function saveSettings() {
+    const newPrefs = {
+      fontSize: parseInt(dom.prefFontSize.value),
+      lineWrap: dom.prefLineWrap.checked,
+      theme: dom.prefTheme.value,
+      maxLines: parseInt(dom.prefMaxLines.value) || 500000,
+      autoTailOnOpen: dom.prefAutoTail.checked,
+    };
+
+    prefs = await window.loglab.savePrefs(newPrefs);
+
+    applyFontSize(newPrefs.fontSize);
+    applyLineWrap(newPrefs.lineWrap);
+
+    // Show saved confirmation
+    dom.settingsSavedMsg.classList.remove('hidden');
+    setTimeout(() => dom.settingsSavedMsg.classList.add('hidden'), 2000);
+  }
+
+  // ============================================================
+  // Go To Line Modal
+  // ============================================================
+  function openGotoModal() {
+    const tab = getActiveTab();
+    if (!tab) return;
+    dom.gotoLineHint.textContent = `Total lines: ${formatNum(tab.filteredEntries.length)}`;
+    dom.gotoLineInput.value = '';
+    showModal('goto');
+    setTimeout(() => dom.gotoLineInput.focus(), 50);
+  }
+
+  function gotoLine() {
+    const tab = getActiveTab();
+    if (!tab) return;
+
+    const lineNum = parseInt(dom.gotoLineInput.value);
+    if (isNaN(lineNum) || lineNum < 1) return;
+
+    // Find in filteredEntries by actual line number
+    let idx = tab.filteredEntries.findIndex(e => e.line === lineNum);
+    if (idx === -1) {
+      // Fallback: find closest
+      idx = Math.min(lineNum - 1, tab.filteredEntries.length - 1);
+    }
+
+    if (idx >= 0) {
+      scrollToLine(idx);
+      renderLogLines();
+    }
+
+    closeModal();
+  }
+
+  // ============================================================
+  // Advanced Search Modal
+  // ============================================================
+  function openAdvSearch() {
+    // Pre-fill from existing state if any
+    if (state.advSearch) {
+      dom.advsearchText.value = state.advSearch.text || '';
+      dom.advsearchRegex.checked = state.advSearch.regex || false;
+      dom.advsearchCase.checked = state.advSearch.caseSensitive || false;
+      dom.advsearchFrom.value = state.advSearch.fromDate || '';
+      dom.advsearchTo.value = state.advSearch.toDate || '';
+      dom.advsearchLevel.value = state.advSearch.level || 'all';
+      dom.advsearchSource.value = state.advSearch.source || '';
+    } else {
+      dom.advsearchText.value = state.searchQuery || '';
+      dom.advsearchRegex.checked = state.searchRegex;
+      dom.advsearchCase.checked = state.searchCaseSensitive;
+      dom.advsearchFrom.value = '';
+      dom.advsearchTo.value = '';
+      dom.advsearchLevel.value = state.levelFilter;
+      dom.advsearchSource.value = '';
+    }
+    dom.advsearchResultCount.textContent = '';
+    showModal('advsearch');
+    setTimeout(() => dom.advsearchText.focus(), 50);
+  }
+
+  function previewAdvSearch() {
+    const tab = getActiveTab();
+    if (!tab) return;
+
+    const adv = collectAdvSearchParams();
+    let entries = tab.entries;
+
+    if (adv.level !== 'all') entries = entries.filter(e => e.level === adv.level);
+
+    if (adv.text) {
+      try {
+        let re = adv.regex
+          ? new RegExp(adv.text, adv.caseSensitive ? '' : 'i')
+          : new RegExp(escapeRegex(adv.text), adv.caseSensitive ? '' : 'i');
+        entries = entries.filter(e => re.test(e.raw));
+      } catch { /* bad regex */ }
+    }
+
+    if (adv.fromDate || adv.toDate) {
+      const from = adv.fromDate ? new Date(adv.fromDate).getTime() : 0;
+      const to = adv.toDate ? new Date(adv.toDate).getTime() : Infinity;
+      entries = entries.filter(e => {
+        if (!e.timestamp) return true;
+        const t = new Date(e.timestamp).getTime();
+        return !isNaN(t) && t >= from && t <= to;
+      });
+    }
+
+    if (adv.source) {
+      const srcPattern = new RegExp(escapeRegex(adv.source), 'i');
+      entries = entries.filter(e => srcPattern.test(e.source));
+    }
+
+    dom.advsearchResultCount.textContent = `${formatNum(entries.length)} matching lines`;
+  }
+
+  function collectAdvSearchParams() {
+    return {
+      text: dom.advsearchText.value.trim(),
+      regex: dom.advsearchRegex.checked,
+      caseSensitive: dom.advsearchCase.checked,
+      fromDate: dom.advsearchFrom.value || '',
+      toDate: dom.advsearchTo.value || '',
+      level: dom.advsearchLevel.value,
+      source: dom.advsearchSource.value.trim(),
+    };
+  }
+
+  function applyAdvSearch() {
+    state.advSearch = collectAdvSearchParams();
+
+    // Sync level filter button state
+    $$('.level-btn').forEach(b => b.classList.remove('active'));
+    const levelBtnEl = document.querySelector(`.level-btn[data-level="${state.advSearch.level}"]`);
+    if (levelBtnEl) levelBtnEl.classList.add('active');
+    state.levelFilter = state.advSearch.level;
+
+    applyFilters();
+    closeModal();
+
+    // Show indicator in status
+    dom.statusText.textContent = `Advanced filter active — ${formatNum(getActiveTab()?.filteredEntries.length || 0)} lines shown`;
+  }
+
+  function resetAdvSearch() {
+    state.advSearch = null;
+    dom.advsearchText.value = '';
+    dom.advsearchRegex.checked = false;
+    dom.advsearchCase.checked = false;
+    dom.advsearchFrom.value = '';
+    dom.advsearchTo.value = '';
+    dom.advsearchLevel.value = 'all';
+    dom.advsearchSource.value = '';
+    dom.advsearchResultCount.textContent = '';
+    state.levelFilter = 'all';
+    $$('.level-btn').forEach(b => b.classList.remove('active'));
+    document.querySelector('.level-btn[data-level="all"]').classList.add('active');
+    applyFilters();
+    closeModal();
+    dom.statusText.textContent = 'Advanced filter cleared';
+  }
+
+  // ============================================================
+  // Modal helpers
+  // ============================================================
+  function showModal(which) {
+    dom.modalOverlay.classList.remove('hidden');
+    dom.gotoModal.classList.toggle('hidden', which !== 'goto');
+    dom.advsearchModal.classList.toggle('hidden', which !== 'advsearch');
+  }
+
+  function closeModal() {
+    dom.modalOverlay.classList.add('hidden');
+    dom.gotoModal.classList.add('hidden');
+    dom.advsearchModal.classList.add('hidden');
   }
 
   // ============================================================
@@ -810,6 +1114,19 @@
     $('#btn-stats-toggle').addEventListener('click', () => toggleSidebar('stats'));
     $('#btn-bookmark-toggle').addEventListener('click', () => toggleSidebar('bookmarks'));
     $('#btn-timeline-toggle').addEventListener('click', toggleTimeline);
+    $('#btn-settings-toggle').addEventListener('click', toggleSettings);
+    $('#btn-settings-close').addEventListener('click', toggleSettings);
+
+    // Settings controls
+    dom.prefFontSize.addEventListener('input', () => {
+      const val = parseInt(dom.prefFontSize.value);
+      dom.prefFontSizeVal.textContent = val + 'px';
+      applyFontSize(val);
+    });
+    dom.prefLineWrap.addEventListener('change', () => {
+      applyLineWrap(dom.prefLineWrap.checked);
+    });
+    $('#btn-save-settings').addEventListener('click', saveSettings);
 
     // Auto-scroll
     $('#btn-autoscroll').addEventListener('click', () => {
@@ -842,8 +1159,15 @@
     // Search
     dom.searchInput.addEventListener('input', debounce(() => {
       state.searchQuery = dom.searchInput.value;
-      computeSearchMatches();
-      renderLogLines();
+      // If there's an active advanced search, don't clobber it just because someone
+      // is typing in the quick search bar. Clear adv search instead.
+      if (state.advSearch && state.searchQuery) {
+        state.advSearch = null;
+        applyFilters();
+      } else {
+        computeSearchMatches();
+        renderLogLines();
+      }
     }, 150));
 
     dom.searchRegex.addEventListener('change', () => {
@@ -860,6 +1184,13 @@
 
     $('#search-next').addEventListener('click', () => navigateSearch('next'));
     $('#search-prev').addEventListener('click', () => navigateSearch('prev'));
+    dom.searchClear.addEventListener('click', () => {
+      clearSearch();
+      if (state.advSearch) {
+        state.advSearch = null;
+        applyFilters();
+      }
+    });
 
     // Level filter buttons
     $$('.level-btn').forEach(btn => {
@@ -867,20 +1198,23 @@
         $$('.level-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         state.levelFilter = btn.dataset.level;
+        // If adv search is active, update its level too
+        if (state.advSearch) state.advSearch.level = btn.dataset.level;
         applyFilters();
       });
     });
 
     // Sidebar close buttons
     $$('.sidebar-close').forEach(btn => {
-      btn.addEventListener('click', () => toggleSidebar(btn.dataset.panel));
+      if (btn.dataset.panel) {
+        btn.addEventListener('click', () => toggleSidebar(btn.dataset.panel));
+      }
     });
 
     // Virtual scroll
     dom.scrollContainer.addEventListener('scroll', () => {
       renderLogLines();
 
-      // Disable auto-scroll if user scrolls up
       if (state.autoScroll) {
         const tab = getActiveTab();
         if (tab) {
@@ -893,17 +1227,67 @@
       }
     });
 
+    // Go to Line modal
+    $('#goto-line-ok').addEventListener('click', gotoLine);
+    $('#goto-line-cancel').addEventListener('click', closeModal);
+    dom.gotoLineInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') gotoLine();
+      if (e.key === 'Escape') closeModal();
+    });
+
+    // Advanced search modal
+    $('#advsearch-apply').addEventListener('click', applyAdvSearch);
+    $('#advsearch-reset').addEventListener('click', resetAdvSearch);
+    $('#advsearch-cancel').addEventListener('click', closeModal);
+    // Live preview count as you type
+    [dom.advsearchText, dom.advsearchSource].forEach(el => {
+      el.addEventListener('input', debounce(previewAdvSearch, 200));
+    });
+    [dom.advsearchRegex, dom.advsearchCase, dom.advsearchFrom, dom.advsearchTo, dom.advsearchLevel].forEach(el => {
+      el.addEventListener('change', debounce(previewAdvSearch, 100));
+    });
+    dom.advsearchText.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') applyAdvSearch();
+      if (e.key === 'Escape') closeModal();
+    });
+
+    // Close modal on overlay background click
+    dom.modalOverlay.addEventListener('click', (e) => {
+      if (e.target === dom.modalOverlay) closeModal();
+    });
+
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
-      if (e.ctrlKey && e.key === 'o') { e.preventDefault(); openFile(); }
-      if (e.ctrlKey && e.key === 'f') { e.preventDefault(); dom.searchInput.focus(); dom.searchInput.select(); }
-      if (e.ctrlKey && e.key === 'b') { e.preventDefault(); toggleSidebar('bookmarks'); }
-      if (e.key === 'F3' || (e.ctrlKey && e.key === 'g')) { e.preventDefault(); navigateSearch(e.shiftKey ? 'prev' : 'next'); }
+      // Ctrl+O — Open file
+      if (e.ctrlKey && !e.shiftKey && e.key === 'o') { e.preventDefault(); openFile(); }
+      // Ctrl+F — Focus search
+      if (e.ctrlKey && !e.shiftKey && e.key === 'f') { e.preventDefault(); dom.searchInput.focus(); dom.searchInput.select(); }
+      // Ctrl+B — Toggle bookmarks
+      if (e.ctrlKey && !e.shiftKey && e.key === 'b') { e.preventDefault(); toggleSidebar('bookmarks'); }
+      // Ctrl+G — Go to line
+      if (e.ctrlKey && !e.shiftKey && e.key === 'g') { e.preventDefault(); openGotoModal(); }
+      // Ctrl+L — Clear current filter (search + adv search)
+      if (e.ctrlKey && !e.shiftKey && e.key === 'l') {
+        e.preventDefault();
+        clearSearch();
+        if (state.advSearch) {
+          state.advSearch = null;
+          applyFilters();
+          dom.statusText.textContent = 'Filters cleared';
+        }
+      }
+      // Ctrl+Shift+F — Advanced search
+      if (e.ctrlKey && e.shiftKey && e.key === 'F') { e.preventDefault(); openAdvSearch(); }
+      // F3 / Shift+F3 — next/prev search match
+      if (e.key === 'F3') { e.preventDefault(); navigateSearch(e.shiftKey ? 'prev' : 'next'); }
+      // Ctrl+W — Close tab
+      if (e.ctrlKey && !e.shiftKey && e.key === 'w') { e.preventDefault(); if (state.activeTabId) closeTab(state.activeTabId); }
+      // Escape — Close things
       if (e.key === 'Escape') {
+        if (!dom.modalOverlay.classList.contains('hidden')) { closeModal(); return; }
         dom.searchInput.blur();
         dom.exportMenu.classList.add('hidden');
       }
-      if (e.ctrlKey && e.key === 'w') { e.preventDefault(); if (state.activeTabId) closeTab(state.activeTabId); }
     });
 
     // Resize -> re-render
@@ -947,6 +1331,7 @@
   // Init
   // ============================================================
   async function init() {
+    await loadSettings();
     setupEvents();
     setupDragDrop();
     showWelcome(true);
