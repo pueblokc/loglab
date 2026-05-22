@@ -1,0 +1,16 @@
+node_modules/
+dist/
+out/
+*.db
+*.log
+.env
+.env.*
+thumbs.db
+Desktop.ini
+.DS_Store
+
+# runtime artifacts
+window-state.json
+dashboard-config.json
+loglab-prefs.json
+*-prefs.json
