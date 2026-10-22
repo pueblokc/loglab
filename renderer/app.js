@@ -5,6 +5,10 @@
 (() => {
   'use strict';
 
+  const L = window.LogLabShared; // lib/shared.js
+  // Max time a filter/search pass may take before it stops with partial results.
+  const SEARCH_BUDGET_MS = 4000;
+
   // ---- State ----
   const state = {
     tabs: [],           // { id, name, path, entries, filteredEntries, stats, bookmarks, tailing, scrollPos }
@@ -13,6 +17,7 @@
     searchRegex: false,
     searchCaseSensitive: false,
     searchMatches: [],   // indices into filteredEntries
+    searchMatchSet: new Set(),
     searchCurrentIdx: -1,
     levelFilter: 'all',
     autoScroll: false,
@@ -164,7 +169,7 @@
     }
 
     // Search match
-    if (state.searchMatches.includes(idx)) {
+    if (state.searchMatchSet.has(idx)) {
       div.classList.add('search-match');
       if (idx === state.searchMatches[state.searchCurrentIdx]) {
         div.classList.add('search-current');
@@ -189,7 +194,7 @@
     // Content
     const content = document.createElement('div');
     content.className = 'log-content';
-    content.innerHTML = highlightLogLine(entry);
+    content.innerHTML = L.highlightLine(entry, getHighlightRe());
 
     div.appendChild(gutter);
     div.appendChild(content);
@@ -203,109 +208,39 @@
     return div;
   }
 
-  function highlightLogLine(entry) {
-    let text = escapeHtml(entry.raw);
-
-    // Highlight timestamp
-    if (entry.timestamp) {
-      const escaped = escapeHtml(entry.timestamp);
-      text = text.replace(escaped, `<span class="ts">${escaped}</span>`);
+  // Compiled (global) regex for highlighting, cached so it isn't rebuilt for
+  // every rendered line.
+  let hlCache = { key: null, re: null };
+  function getHighlightRe() {
+    const q = state.advSearch ? state.advSearch.text : state.searchQuery;
+    const regex = state.advSearch ? state.advSearch.regex : state.searchRegex;
+    const cs = state.advSearch ? state.advSearch.caseSensitive : state.searchCaseSensitive;
+    const key = `${q}\u0000${regex}\u0000${cs}`;
+    if (hlCache.key !== key) {
+      hlCache = { key, re: L.compileSearch(q, { regex, caseSensitive: cs, global: true }).re };
     }
-
-    // Highlight source
-    if (entry.source) {
-      const escaped = escapeHtml(entry.source);
-      text = text.replace(escaped, `<span class="src">${escaped}</span>`);
-    }
-
-    // Highlight level keyword
-    const levelPatterns = {
-      FATAL: /\b(FATAL|CRITICAL|CRIT)\b/gi,
-      ERROR: /\b(ERROR|ERR)\b/gi,
-      WARN: /\b(WARNING|WARN)\b/gi,
-      INFO: /\b(INFO|INFORMATION|NOTICE)\b/gi,
-      DEBUG: /\b(DEBUG|TRACE|VERBOSE)\b/gi,
-    };
-    const pat = levelPatterns[entry.level];
-    if (pat) {
-      text = text.replace(pat, `<span class="level-tag level-${entry.level}">$1</span>`);
-    }
-
-    // Highlight search matches (both quick search and advanced search text)
-    const searchQ = state.advSearch ? state.advSearch.text : state.searchQuery;
-    const searchIsRegex = state.advSearch ? state.advSearch.regex : state.searchRegex;
-    const searchIsCase = state.advSearch ? state.advSearch.caseSensitive : state.searchCaseSensitive;
-
-    if (searchQ) {
-      try {
-        let searchRe;
-        if (searchIsRegex) {
-          searchRe = new RegExp(`(${searchQ})`, searchIsCase ? 'g' : 'gi');
-        } else {
-          const escaped = escapeRegex(searchQ);
-          searchRe = new RegExp(`(${escaped})`, searchIsCase ? 'g' : 'gi');
-        }
-        text = text.replace(searchRe, '<span class="search-highlight">$1</span>');
-      } catch { /* invalid regex */ }
-    }
-
-    return text;
+    return hlCache.re;
   }
 
   // ============================================================
   // Filtering
   // ============================================================
+  function currentFilterCriteria() {
+    const level = (state.advSearch && state.advSearch.level !== 'all')
+      ? state.advSearch.level
+      : state.levelFilter;
+    return state.advSearch ? Object.assign({}, state.advSearch, { level }) : { level };
+  }
+
   function applyFilters() {
     const tab = getActiveTab();
     if (!tab) return;
 
-    let entries = tab.entries;
-
-    // Level filter (toolbar level buttons or advanced search level)
-    const levelFilter = (state.advSearch && state.advSearch.level !== 'all')
-      ? state.advSearch.level
-      : state.levelFilter;
-
-    if (levelFilter !== 'all') {
-      entries = entries.filter(e => e.level === levelFilter);
-    }
-
-    // Advanced search filters
-    if (state.advSearch) {
-      const adv = state.advSearch;
-
-      // Text filter
-      if (adv.text) {
-        try {
-          let re;
-          if (adv.regex) {
-            re = new RegExp(adv.text, adv.caseSensitive ? '' : 'i');
-          } else {
-            re = new RegExp(escapeRegex(adv.text), adv.caseSensitive ? '' : 'i');
-          }
-          entries = entries.filter(e => re.test(e.raw));
-        } catch { /* bad regex, skip */ }
-      }
-
-      // Date range filter
-      if (adv.fromDate || adv.toDate) {
-        const from = adv.fromDate ? new Date(adv.fromDate).getTime() : 0;
-        const to = adv.toDate ? new Date(adv.toDate).getTime() : Infinity;
-        entries = entries.filter(e => {
-          if (!e.timestamp) return true; // keep lines without timestamps
-          const t = new Date(e.timestamp).getTime();
-          return !isNaN(t) && t >= from && t <= to;
-        });
-      }
-
-      // Source filter
-      if (adv.source) {
-        const srcPattern = new RegExp(escapeRegex(adv.source), 'i');
-        entries = entries.filter(e => srcPattern.test(e.source));
-      }
-    }
-
+    const filter = L.buildEntryFilter(currentFilterCriteria());
+    const { entries, timedOut } = L.filterEntries(tab.entries, filter.test, SEARCH_BUDGET_MS);
     tab.filteredEntries = entries;
+    if (filter.error) dom.statusText.textContent = `Filter text ignored: ${filter.error}`;
+    else if (timedOut) dom.statusText.textContent = 'Filter stopped early (pattern too slow) — results are partial';
 
     // Compute search matches (quick search bar, not advanced)
     computeSearchMatches();
@@ -315,8 +250,13 @@
     updateTimeline();
   }
 
+  function setSearchMatches(matches) {
+    state.searchMatches = matches;
+    state.searchMatchSet = new Set(matches);
+  }
+
   function computeSearchMatches() {
-    state.searchMatches = [];
+    setSearchMatches([]);
     state.searchCurrentIdx = -1;
 
     const tab = getActiveTab();
@@ -325,30 +265,23 @@
       return;
     }
 
-    try {
-      let searchRe;
-      if (state.searchRegex) {
-        searchRe = new RegExp(state.searchQuery, state.searchCaseSensitive ? '' : 'i');
-      } else {
-        const escaped = escapeRegex(state.searchQuery);
-        searchRe = new RegExp(escaped, state.searchCaseSensitive ? '' : 'i');
-      }
-
-      tab.filteredEntries.forEach((entry, idx) => {
-        if (searchRe.test(entry.raw)) {
-          state.searchMatches.push(idx);
-        }
-      });
-
-      if (state.searchMatches.length > 0) {
-        state.searchCurrentIdx = 0;
-        dom.searchCount.textContent = `1/${state.searchMatches.length}`;
-      } else {
-        dom.searchCount.textContent = '0 results';
-      }
-    } catch {
-      dom.searchCount.textContent = 'Invalid regex';
+    const { re, error } = L.compileSearch(state.searchQuery, { regex: state.searchRegex, caseSensitive: state.searchCaseSensitive });
+    if (!re) {
+      dom.searchCount.textContent = error;
+      dom.searchCount.title = error;
+      return;
     }
+    dom.searchCount.title = '';
+
+    const { matches, timedOut } = L.findMatches(tab.filteredEntries, re, SEARCH_BUDGET_MS);
+    setSearchMatches(matches);
+    if (matches.length > 0) {
+      state.searchCurrentIdx = 0;
+      dom.searchCount.textContent = `1/${matches.length}${timedOut ? '+' : ''}`;
+    } else {
+      dom.searchCount.textContent = timedOut ? 'Too slow' : '0 results';
+    }
+    if (timedOut) dom.statusText.textContent = 'Search stopped early (pattern too slow) — matches are partial';
   }
 
   function navigateSearch(direction) {
@@ -376,7 +309,7 @@
     state.searchQuery = '';
     dom.searchInput.value = '';
     dom.searchCount.textContent = '';
-    state.searchMatches = [];
+    setSearchMatches([]);
     state.searchCurrentIdx = -1;
     renderLogLines();
   }
@@ -390,6 +323,7 @@
       id, name, path: filePath,
       entries: [], filteredEntries: [], stats: null,
       bookmarks: [], tailing: false, scrollPos: 0,
+      tailFrom: null, encoding: '',
     };
     state.tabs.push(tab);
     renderTabs();
@@ -415,6 +349,9 @@
         dom.titleFile.textContent = '';
         dom.statusLines.textContent = '';
         dom.statusFiltered.textContent = '';
+        dom.statusEncoding.textContent = '';
+        dom.statusTail.classList.add('hidden');
+        $('#btn-tail').classList.remove('active');
         dom.viewport.innerHTML = '';
         dom.spacer.style.height = '0px';
       }
@@ -434,6 +371,8 @@
     showWelcome(false);
 
     dom.statusTail.classList.toggle('hidden', !tab.tailing);
+    $('#btn-tail').classList.toggle('active', tab.tailing);
+    dom.statusEncoding.textContent = tab.encoding || '';
 
     applyFilters();
     renderTabs();
@@ -485,31 +424,40 @@
     window.loglab.addRecentFile(filePath);
 
     let tab = state.tabs.find(t => t.path === filePath);
-    if (tab) {
-      tab.entries = result.entries;
-      tab.stats = result.stats;
-      tab.filteredEntries = result.entries;
-      switchTab(tab.id);
-    } else {
-      tab = createTab(result.name, filePath);
-      tab.entries = result.entries;
-      tab.stats = result.stats;
-      tab.filteredEntries = result.entries;
-    }
+    const isNew = !tab;
+    if (isNew) tab = createTab(result.name, filePath);
+    tab.entries = result.entries;
+    tab.stats = result.stats;
+    tab.filteredEntries = result.entries;
+    tab.encoding = encodingLabel(result.encoding);
+    // Where tail mode should continue from (unknown for gzip / truncated reads).
+    tab.tailFrom = typeof result.endOffset === 'number'
+      ? { offset: result.endOffset, lineNum: (result.lineCount || 0) + 1, encoding: result.encoding }
+      : null;
 
     const bookmarks = await window.loglab.getBookmarks(filePath);
     tab.bookmarks = bookmarks || [];
 
-    applyFilters();
-    dom.statusText.textContent = `Loaded ${result.name} (${formatSize(result.fileStats?.size || 0)})`;
-    dom.statusEncoding.textContent = filePath.toLowerCase().endsWith('.gz') ? 'gzip/UTF-8' : 'UTF-8';
+    if (isNew) applyFilters(); else switchTab(tab.id);
+    let msg = `Loaded ${result.name} (${formatSize(result.fileStats?.size || 0)})`;
+    if (result.truncated) msg += ` — first ${formatNum(result.lineCount)} lines only (Max Lines setting)`;
+    dom.statusText.textContent = msg;
+    if (tab.id === state.activeTabId) dom.statusEncoding.textContent = tab.encoding;
 
-    // Auto-tail on open if pref enabled
-    if (prefs.autoTailOnOpen && !tab.tailing) {
+    if (tab.tailing) {
+      // Reloaded while tailing: restart from the new read position.
+      await window.loglab.startTail(tab.path, tab.id, tab.tailFrom);
+    } else if (prefs.autoTailOnOpen && tab.id === state.activeTabId) {
       await toggleTail();
     } else if (state.autoScroll) {
       scrollToLine(tab.filteredEntries.length - 1);
     }
+  }
+
+  function encodingLabel(enc) {
+    if (enc === 'utf16le') return 'UTF-16LE';
+    if (enc === 'gzip/utf8') return 'gzip/UTF-8';
+    return 'UTF-8';
   }
 
   async function openFile() {
@@ -522,6 +470,7 @@
     const dir = await window.loglab.openDirDialog();
     if (!dir) return;
     dom.statusText.textContent = `Watching ${dir}...`;
+    dirLoadsPending = 0;
     await window.loglab.watchDirectory(dir);
   }
 
@@ -538,7 +487,11 @@
       dom.statusTail.classList.add('hidden');
       dom.statusText.textContent = 'Tail stopped';
     } else {
-      await window.loglab.startTail(tab.path, tab.id);
+      const res = await window.loglab.startTail(tab.path, tab.id, tab.tailFrom);
+      if (res && res.error) {
+        dom.statusText.textContent = res.error;
+        return;
+      }
       tab.tailing = true;
       state.autoScroll = true;
       $('#btn-autoscroll').classList.add('active');
@@ -551,67 +504,72 @@
   }
 
   // Handle incoming tail data
-  window.loglab.onTailData(async ({ tabId, entries }) => {
+  window.loglab.onTailData(({ tabId, entries }) => {
     const tab = state.tabs.find(t => t.id === tabId);
-    if (!tab) return;
+    if (!tab || !tab.tailing) return;
 
-    // Assign real line numbers
-    const startLine = tab.entries.length + 1;
-    entries.forEach((e, i) => { e.line = startLine + i; });
+    // Main numbers lines when it knows where the initial read ended; otherwise
+    // continue from the last line we have.
+    let next = tab.entries.length ? tab.entries[tab.entries.length - 1].line + 1 : 1;
+    for (const e of entries) {
+      if (e.line > 0 && e.line >= next) next = e.line + 1;
+      else e.line = next++;
+    }
 
     tab.entries.push(...entries);
 
-    // Re-filter new entries and add to filteredEntries
-    let newFiltered = entries;
-    const levelFilter = (state.advSearch && state.advSearch.level !== 'all')
-      ? state.advSearch.level
-      : state.levelFilter;
-
-    if (levelFilter !== 'all') {
-      newFiltered = newFiltered.filter(e => e.level === levelFilter);
-    }
-
-    // Apply advanced search filter if active
-    if (state.advSearch) {
-      const adv = state.advSearch;
-      if (adv.text) {
-        try {
-          let re = adv.regex
-            ? new RegExp(adv.text, adv.caseSensitive ? '' : 'i')
-            : new RegExp(escapeRegex(adv.text), adv.caseSensitive ? '' : 'i');
-          newFiltered = newFiltered.filter(e => re.test(e.raw));
-        } catch { /* skip */ }
-      }
-      if (adv.source) {
-        const srcPattern = new RegExp(escapeRegex(adv.source), 'i');
-        newFiltered = newFiltered.filter(e => srcPattern.test(e.source));
-      }
-    }
-
+    // Apply the same filter as applyFilters (level, text, date range, source).
+    const filter = L.buildEntryFilter(currentFilterCriteria());
+    const newFiltered = entries.filter(filter.test);
+    const base = tab.filteredEntries.length;
     tab.filteredEntries.push(...newFiltered);
 
-    // Update stats incrementally (both level counts AND hourly/error patterns)
-    if (tab.stats) {
-      // Do incremental update in main process to keep logic centralized
-      tab.stats = await window.loglab.updateStats(tab.stats, entries);
+    // Keep quick-search matches current for the appended lines.
+    if (tab.id === state.activeTabId && state.searchQuery && !state.advSearch) {
+      const { re } = L.compileSearch(state.searchQuery, { regex: state.searchRegex, caseSensitive: state.searchCaseSensitive });
+      if (re) {
+        newFiltered.forEach((e, i) => {
+          if (re.test(e.raw)) { state.searchMatches.push(base + i); state.searchMatchSet.add(base + i); }
+        });
+        if (state.searchMatches.length > 0) {
+          if (state.searchCurrentIdx < 0) state.searchCurrentIdx = 0;
+          dom.searchCount.textContent = `${state.searchCurrentIdx + 1}/${state.searchMatches.length}`;
+        }
+      }
     }
 
+    // Update stats synchronously so overlapping tail events can't lose counts.
+    if (tab.stats) tab.stats = L.updateStats(tab.stats, entries);
+
     if (tab.id === state.activeTabId) {
-      if (state.autoScroll) {
-        renderLogLines();
-        scrollToLine(tab.filteredEntries.length - 1);
-      } else {
-        renderLogLines();
-      }
+      renderLogLines();
+      if (state.autoScroll) scrollToLine(tab.filteredEntries.length - 1);
       updateStatusBar();
       if (state.sidebarPanel === 'stats') renderStats();
+      if (state.timelineVisible) updateTimeline();
     }
   });
 
-  // Handle directory file discovery
+  window.loglab.onTailError(({ tabId, error }) => {
+    const tab = state.tabs.find(t => t.id === tabId);
+    if (tab) dom.statusText.textContent = `Tail error (${tab.name}): ${error}`;
+  });
+
+  // Handle directory file discovery. Files arrive in a burst for an existing
+  // folder; count loads in flight so we don't open dozens of files at once.
+  const MAX_DIR_TABS = 5;
+  let dirLoadsPending = 0;
   window.loglab.onDirFileFound(({ path: fp, name }) => {
     dom.statusText.textContent = `Found: ${name}`;
-    if (state.tabs.length < 5) loadFile(fp);
+    if (state.tabs.some(t => t.path === fp)) return;
+    if (state.tabs.length + dirLoadsPending >= MAX_DIR_TABS) return;
+    dirLoadsPending++;
+    loadFile(fp).finally(() => { dirLoadsPending--; });
+  });
+
+  // Files opened via file association / command line while running
+  window.loglab.onOpenFiles(async (files) => {
+    for (const fp of files) await loadFile(fp);
   });
 
   // ============================================================
@@ -701,11 +659,11 @@
     }).join('');
 
     if (s.hourlyData && s.hourlyData.length > 0) {
-      const maxCount = Math.max(...s.hourlyData.map(h => h.count)) || 1;
+      const maxCount = L.maxOf(s.hourlyData, h => h.count) || 1;
       dom.hourlyChart.innerHTML = s.hourlyData.map(h => {
         const pct = (h.count / maxCount * 100);
         return `<div class="hourly-bar" style="height:${Math.max(2, pct)}%">
-          <div class="tooltip">${h.hour}: ${formatNum(h.count)} msgs</div>
+          <div class="tooltip">${escapeHtml(h.hour)}: ${formatNum(h.count)} msgs</div>
         </div>`;
       }).join('');
     } else {
@@ -715,7 +673,7 @@
     if (s.topErrors && s.topErrors.length > 0) {
       dom.errorPatterns.innerHTML = s.topErrors.map(e =>
         `<div class="error-pattern-item">
-          <span class="error-pattern-count">${e.count}</span>
+          <span class="error-pattern-count">${formatNum(e.count)}</span>
           <span class="error-pattern-text" title="${escapeHtml(e.pattern)}">${escapeHtml(e.pattern)}</span>
         </div>`
       ).join('');
@@ -754,7 +712,7 @@
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const data = tab.stats.hourlyData;
-    const maxCount = Math.max(...data.map(h => h.count)) || 1;
+    const maxCount = L.maxOf(data, h => h.count) || 1;
     const barWidth = Math.max(2, canvas.width / data.length - 1);
 
     data.forEach((h, i) => {
@@ -784,8 +742,9 @@
     const tab = getActiveTab();
     if (!tab) return;
 
-    const ok = await window.loglab.exportData(tab.filteredEntries, format);
-    dom.statusText.textContent = ok ? `Exported as ${format.toUpperCase()}` : 'Export cancelled';
+    const res = await window.loglab.exportData(tab.filteredEntries, format);
+    if (res && res.error) dom.statusText.textContent = `Export failed: ${res.error}`;
+    else dom.statusText.textContent = res ? `Exported as ${format.toUpperCase()}` : 'Export cancelled';
     dom.exportMenu.classList.add('hidden');
   }
 
@@ -910,12 +869,10 @@
     const lineNum = parseInt(dom.gotoLineInput.value);
     if (isNaN(lineNum) || lineNum < 1) return;
 
-    // Find in filteredEntries by actual line number
-    let idx = tab.filteredEntries.findIndex(e => e.line === lineNum);
-    if (idx === -1) {
-      // Fallback: find closest
-      idx = Math.min(lineNum - 1, tab.filteredEntries.length - 1);
-    }
+    // First shown line at or after the requested line number (filtered views
+    // and skipped blank lines mean the exact line may not be present).
+    let idx = L.findLineIndex(tab.filteredEntries, lineNum);
+    if (idx === -1) idx = tab.filteredEntries.length - 1;
 
     if (idx >= 0) {
       scrollToLine(idx);
@@ -956,35 +913,16 @@
     const tab = getActiveTab();
     if (!tab) return;
 
-    const adv = collectAdvSearchParams();
-    let entries = tab.entries;
-
-    if (adv.level !== 'all') entries = entries.filter(e => e.level === adv.level);
-
-    if (adv.text) {
-      try {
-        let re = adv.regex
-          ? new RegExp(adv.text, adv.caseSensitive ? '' : 'i')
-          : new RegExp(escapeRegex(adv.text), adv.caseSensitive ? '' : 'i');
-        entries = entries.filter(e => re.test(e.raw));
-      } catch { /* bad regex */ }
+    const filter = L.buildEntryFilter(collectAdvSearchParams());
+    if (filter.error) {
+      dom.advsearchResultCount.textContent = filter.error;
+      return;
     }
-
-    if (adv.fromDate || adv.toDate) {
-      const from = adv.fromDate ? new Date(adv.fromDate).getTime() : 0;
-      const to = adv.toDate ? new Date(adv.toDate).getTime() : Infinity;
-      entries = entries.filter(e => {
-        if (!e.timestamp) return true;
-        const t = new Date(e.timestamp).getTime();
-        return !isNaN(t) && t >= from && t <= to;
-      });
+    const { entries, timedOut } = L.filterEntries(tab.entries, filter.test, SEARCH_BUDGET_MS);
+    if (timedOut) {
+      dom.advsearchResultCount.textContent = `${formatNum(entries.length)}+ matching lines (stopped: pattern too slow)`;
+      return;
     }
-
-    if (adv.source) {
-      const srcPattern = new RegExp(escapeRegex(adv.source), 'i');
-      entries = entries.filter(e => srcPattern.test(e.source));
-    }
-
     dom.advsearchResultCount.textContent = `${formatNum(entries.length)} matching lines`;
   }
 
@@ -1092,7 +1030,8 @@
 
       const files = Array.from(e.dataTransfer.files);
       for (const file of files) {
-        if (file.path) await loadFile(file.path);
+        const fp = window.loglab.getPathForFile(file);
+        if (fp) await loadFile(fp);
       }
     });
   }
@@ -1304,13 +1243,7 @@
   // ============================================================
   // Utilities
   // ============================================================
-  function escapeHtml(str) {
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  }
-
-  function escapeRegex(str) {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
+  const escapeHtml = L.escapeHtml;
 
   function debounce(fn, ms) {
     let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
@@ -1331,12 +1264,15 @@
   // Init
   // ============================================================
   async function init() {
+    document.getElementById('kccs-year').textContent = new Date().getFullYear();
     await loadSettings();
     setupEvents();
     setupDragDrop();
     showWelcome(true);
     await loadRecentFiles();
     dom.statusText.textContent = 'Ready — drag files or press Ctrl+O';
+    const launchFiles = await window.loglab.takePendingFiles();
+    for (const fp of launchFiles) await loadFile(fp);
   }
 
   init();
