@@ -5,6 +5,8 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test \"test/**/*.test.js\"",
+    "lint": "eslint .",
     "build": "electron-builder --win",
     "build:dir": "electron-builder --win --dir"
   },
@@ -53,5 +55,8 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/pueblokc/loglab.git"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
