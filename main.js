@@ -1,20 +1,49 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, globalShortcut, screen, nativeImage, dialog, shell } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, globalShortcut, screen, nativeImage, dialog, shell, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
-const readline = require('readline');
-const { Readable } = require('stream');
 const chokidar = require('chokidar');
+const { computeStats, updateStats, toCSV } = require('./lib/shared');
+const { readLogFile, Tailer } = require('./lib/logfile');
 
 // --- Config ---
-const STATE_FILE = path.join(__dirname, 'window-state.json');
-const PREFS_FILE = path.join(__dirname, 'loglab-prefs.json');
+// Runtime state lives in the per-user data dir (%APPDATA%\LogLab on Windows).
+// The app directory is read-only once packaged (app.asar / Program Files), so
+// writing next to the app silently lost every setting and bookmark.
+const USER_DIR = app.getPath('userData');
+const STATE_FILE = path.join(USER_DIR, 'window-state.json');
+const PREFS_FILE = path.join(USER_DIR, 'loglab-prefs.json');
+const LEGACY_DIR = __dirname;
 const ICON_FILE = path.join(__dirname, 'assets', 'icon.png');
 
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
-let fileWatchers = new Map(); // path -> { watcher, size }
+const fileWatchers = new Map(); // tabId -> { watcher, tailer, path }
+let pendingOpenFiles = [];      // files passed on the command line / via file association
+
+// One-time copy of settings written by v1.0.0 next to the app (source checkouts).
+function migrateLegacyFile(name) {
+  const dest = path.join(USER_DIR, name);
+  const legacy = path.join(LEGACY_DIR, name);
+  try {
+    if (!fs.existsSync(dest) && fs.existsSync(legacy)) {
+      fs.mkdirSync(USER_DIR, { recursive: true });
+      fs.copyFileSync(legacy, dest);
+    }
+  } catch { /* ignore */ }
+}
+migrateLegacyFile('loglab-prefs.json');
+migrateLegacyFile('window-state.json');
+
+// Write via temp file + rename so a crash mid-write can't corrupt the file
+// (a corrupt prefs file would reset settings and wipe all bookmarks).
+function writeFileAtomic(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+}
 
 // ============================================================
 // Preferences
@@ -40,17 +69,16 @@ function loadPrefs() {
 }
 
 function savePrefs(prefs) {
-  try { fs.writeFileSync(PREFS_FILE, JSON.stringify(prefs, null, 2)); } catch { /* ignore */ }
+  try { writeFileAtomic(PREFS_FILE, JSON.stringify(prefs, null, 2)); } catch { /* ignore */ }
 }
 
 // ============================================================
 // Icon Generation (Catppuccin Mauve)
 // ============================================================
 function ensureIcon() {
-  const dir = path.dirname(ICON_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   if (fs.existsSync(ICON_FILE)) return ICON_FILE;
   try {
+    fs.mkdirSync(path.dirname(ICON_FILE), { recursive: true });
     const png = generatePNG(32, 32, { r: 203, g: 166, b: 247 }, 6);
     fs.writeFileSync(ICON_FILE, png);
     return ICON_FILE;
@@ -95,7 +123,7 @@ function saveWindowState() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   try {
     const b = mainWindow.getBounds();
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ x: b.x, y: b.y, width: b.width, height: b.height, maximized: mainWindow.isMaximized() }, null, 2));
+    writeFileAtomic(STATE_FILE, JSON.stringify({ x: b.x, y: b.y, width: b.width, height: b.height, maximized: mainWindow.isMaximized() }, null, 2));
   } catch { /* ignore */ }
 }
 
@@ -119,9 +147,25 @@ function createWindow() {
     minWidth: 800, minHeight: 500,
     frame: false, backgroundColor: '#1e1e2e',
     icon: iconPath || undefined, skipTaskbar: false,
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
     show: false,
   });
+
+  const wc = mainWindow.webContents;
+  // Never open child windows: they would inherit the preload (and with it
+  // file-system access). External http(s) links go to the default browser.
+  wc.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  // The UI is a single local page; block any navigation away from it
+  // (e.g. a file dropped outside the drop handler, or a link click).
+  wc.on('will-navigate', (e, url) => {
+    e.preventDefault();
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+  });
+  // A renderer reload would orphan watchers keyed by the old tab ids.
+  wc.on('did-start-loading', stopAllWatchers);
 
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   mainWindow.once('ready-to-show', () => {
@@ -159,89 +203,8 @@ function toggleWindow() {
 }
 
 // ============================================================
-// Log File Parser
+// Log File Parsing — see lib/shared.js (parsing, stats) and lib/logfile.js
 // ============================================================
-
-// Parse a single log line - detect level, timestamp, source
-function parseLogLine(line, lineNum) {
-  const entry = { line: lineNum, raw: line, level: 'INFO', timestamp: null, source: '', message: line };
-
-  // Detect log level
-  if (/\b(FATAL|CRIT(?:ICAL)?)\b/i.test(line)) entry.level = 'FATAL';
-  else if (/\b(ERR(?:OR)?)\b/i.test(line)) entry.level = 'ERROR';
-  else if (/\b(WARN(?:ING)?)\b/i.test(line)) entry.level = 'WARN';
-  else if (/\b(DEBUG|TRACE|VERBOSE)\b/i.test(line)) entry.level = 'DEBUG';
-  else if (/\b(INFO(?:RMATION)?|NOTICE)\b/i.test(line)) entry.level = 'INFO';
-
-  // Extract timestamp - common patterns
-  const tsPatterns = [
-    // ISO 8601: 2024-01-15T10:30:00.000Z
-    /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/,
-    // Common log: 2024-01-15 10:30:00
-    /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)/,
-    // Syslog: Jan 15 10:30:00
-    /([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/,
-    // Apache/Nginx: [15/Jan/2024:10:30:00 +0000]
-    /\[(\d{2}\/[A-Z][a-z]{2}\/\d{4}:\d{2}:\d{2}:\d{2}\s+[+-]\d{4})\]/,
-    // Epoch seconds
-    /^(\d{10}(?:\.\d+)?)\s/,
-  ];
-
-  for (const pat of tsPatterns) {
-    const m = line.match(pat);
-    if (m) {
-      entry.timestamp = m[1];
-      break;
-    }
-  }
-
-  // Extract source - syslog format: "hostname process[pid]:"
-  const syslogMatch = line.match(/^\S+\s+\d+\s+\d{2}:\d{2}:\d{2}\s+(\S+)\s+(\S+?)(?:\[\d+\])?:/);
-  if (syslogMatch) {
-    entry.source = syslogMatch[2];
-    entry.message = line.substring(line.indexOf(':', line.indexOf(syslogMatch[2])) + 2);
-  }
-
-  return entry;
-}
-
-// Read a log file - handles plain text and gzip
-async function readLogFile(filePath, maxLines) {
-  const limit = maxLines || 500000;
-  return new Promise((resolve, reject) => {
-    const entries = [];
-    let lineNum = 0;
-
-    let inputStream;
-    const isGzip = filePath.toLowerCase().endsWith('.gz');
-
-    try {
-      const fileStream = fs.createReadStream(filePath);
-      if (isGzip) {
-        const gunzip = zlib.createGunzip();
-        fileStream.pipe(gunzip);
-        inputStream = gunzip;
-      } else {
-        inputStream = fileStream;
-      }
-    } catch (err) {
-      return reject(err);
-    }
-
-    const rl = readline.createInterface({ input: inputStream, crlfDelay: Infinity });
-
-    rl.on('line', (line) => {
-      if (lineNum >= limit) return; // respect max lines
-      lineNum++;
-      if (line.trim()) {
-        entries.push(parseLogLine(line, lineNum));
-      }
-    });
-    rl.on('close', () => resolve(entries));
-    rl.on('error', (err) => reject(err));
-    inputStream.on('error', (err) => reject(err));
-  });
-}
 
 // Read file stats
 function getFileStats(filePath) {
@@ -251,147 +214,54 @@ function getFileStats(filePath) {
   } catch { return null; }
 }
 
-// Compute statistics from entries
-function computeStats(entries) {
-  const levelCounts = { FATAL: 0, ERROR: 0, WARN: 0, INFO: 0, DEBUG: 0 };
-  const hourCounts = {};
-  const errorPatterns = {};
-  const sources = {};
-
-  for (const e of entries) {
-    // Level counts
-    if (levelCounts[e.level] !== undefined) levelCounts[e.level]++;
-
-    // Source counts
-    if (e.source) {
-      sources[e.source] = (sources[e.source] || 0) + 1;
-    }
-
-    // Per-hour counts (if timestamp available)
-    if (e.timestamp) {
-      try {
-        const d = new Date(e.timestamp);
-        if (!isNaN(d.getTime())) {
-          const hourKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:00`;
-          hourCounts[hourKey] = (hourCounts[hourKey] || 0) + 1;
-        }
-      } catch { /* skip */ }
-    }
-
-    // Error patterns (first 80 chars of error/warn messages)
-    if (e.level === 'ERROR' || e.level === 'FATAL') {
-      const pattern = e.message.substring(0, 80).replace(/\d+/g, 'N').replace(/0x[0-9a-f]+/gi, '0xN');
-      errorPatterns[pattern] = (errorPatterns[pattern] || 0) + 1;
-    }
-  }
-
-  // Sort error patterns by count
-  const topErrors = Object.entries(errorPatterns)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
-    .map(([pattern, count]) => ({ pattern, count }));
-
-  // Sort hours
-  const hourlyData = Object.entries(hourCounts)
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([hour, count]) => ({ hour, count }));
-
-  return { levelCounts, hourlyData, topErrors, sources, totalLines: entries.length };
-}
-
-// Incrementally update stats with new entries (for tail mode)
-function updateStats(existingStats, newEntries) {
-  const s = existingStats;
-
-  for (const e of newEntries) {
-    if (s.levelCounts[e.level] !== undefined) s.levelCounts[e.level]++;
-
-    if (e.source) {
-      s.sources[e.source] = (s.sources[e.source] || 0) + 1;
-    }
-
-    if (e.timestamp) {
-      try {
-        const d = new Date(e.timestamp);
-        if (!isNaN(d.getTime())) {
-          const hourKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:00`;
-          // Update hourlyData in place
-          const existing = s.hourlyData.find(h => h.hour === hourKey);
-          if (existing) {
-            existing.count++;
-          } else {
-            s.hourlyData.push({ hour: hourKey, count: 1 });
-            s.hourlyData.sort((a, b) => a.hour.localeCompare(b.hour));
-          }
-        }
-      } catch { /* skip */ }
-    }
-
-    if (e.level === 'ERROR' || e.level === 'FATAL') {
-      const pattern = e.message.substring(0, 80).replace(/\d+/g, 'N').replace(/0x[0-9a-f]+/gi, '0xN');
-      const existing = s.topErrors.find(ep => ep.pattern === pattern);
-      if (existing) {
-        existing.count++;
-      } else {
-        s.topErrors.push({ pattern, count: 1 });
-      }
-      // Keep top 20 sorted
-      s.topErrors.sort((a, b) => b.count - a.count);
-      if (s.topErrors.length > 20) s.topErrors.length = 20;
-    }
-  }
-
-  s.totalLines += newEntries.length;
-  return s;
-}
-
 // ============================================================
 // Tail Mode
 // ============================================================
-function startTailing(filePath, tabId) {
-  if (fileWatchers.has(tabId)) {
-    stopTailing(tabId);
-  }
+// opts (optional): { offset, lineNum, encoding } from the initial read, so the
+// tail continues exactly where the read stopped. Returns true or { error }.
+function startTailing(filePath, tabId, opts) {
+  if (fileWatchers.has(tabId)) stopTailing(tabId);
+  if (filePath.toLowerCase().endsWith('.gz')) return { error: 'Tail is not supported for gzip files' };
 
-  let lastSize = 0;
-  try { lastSize = fs.statSync(filePath).size; } catch { /* start from 0 */ }
-
-  const watcher = chokidar.watch(filePath, {
-    persistent: true,
-    awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+  const o = opts || {};
+  const tailer = new Tailer(filePath, {
+    offset: o.offset, lineNum: o.lineNum, encoding: o.encoding,
+    onEntries: (entries) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('tail-data', { tabId, entries });
+    },
+    onError: (err) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('tail-error', { tabId, error: err.message });
+    },
   });
+  tailer.init();
 
-  watcher.on('change', () => {
-    try {
-      const stat = fs.statSync(filePath);
-      if (stat.size > lastSize) {
-        const stream = fs.createReadStream(filePath, { start: lastSize, encoding: 'utf8' });
-        let newData = '';
-        stream.on('data', (chunk) => { newData += chunk; });
-        stream.on('end', () => {
-          const lines = newData.split(/\r?\n/).filter(l => l.trim());
-          const entries = lines.map((line) => parseLogLine(line, -1)); // -1 = tail line (renumbered in renderer)
-          if (entries.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('tail-data', { tabId, entries });
-          }
-          lastSize = stat.size;
-        });
-      } else if (stat.size < lastSize) {
-        // File was truncated/rotated - re-read from beginning
-        lastSize = stat.size;
-      }
-    } catch { /* ignore */ }
-  });
+  // No awaitWriteFinish: a log that is written continuously never becomes
+  // "stable", so tail used to stall on busy files. Tailer only consumes
+  // complete lines, so reading mid-write is safe.
+  const watcher = chokidar.watch(filePath, { persistent: true, ignoreInitial: true });
+  watcher.on('change', () => tailer.check());
+  watcher.on('add', () => tailer.check());        // re-created after rename rotation
+  watcher.on('unlink', () => tailer.markRotated());
+  watcher.on('error', () => { /* reported via tailer reads */ });
 
-  fileWatchers.set(tabId, { watcher, path: filePath });
+  fileWatchers.set(tabId, { watcher, tailer, path: filePath });
+  // Pick up anything written between the initial read and now.
+  tailer.check();
+  return true;
 }
 
 function stopTailing(tabId) {
   const entry = fileWatchers.get(tabId);
   if (entry) {
-    entry.watcher.close();
+    entry.tailer.close();
+    entry.watcher.close().catch(() => {});
     fileWatchers.delete(tabId);
   }
+}
+
+function stopAllWatchers() {
+  for (const tabId of Array.from(fileWatchers.keys())) stopTailing(tabId);
+  if (dirWatcher) { dirWatcher.close().catch(() => {}); dirWatcher = null; }
 }
 
 // ============================================================
@@ -399,26 +269,23 @@ function stopTailing(tabId) {
 // ============================================================
 let dirWatcher = null;
 function watchDirectory(dirPath) {
-  if (dirWatcher) dirWatcher.close();
+  if (dirWatcher) dirWatcher.close().catch(() => {});
   dirWatcher = chokidar.watch(dirPath, {
     persistent: true, depth: 2, ignoreInitial: false,
-    ignored: [/node_modules/, /\.git/],
+    ignored: /(^|[\\/])(node_modules|\.git)([\\/]|$)/,
   });
 
   const logExts = ['.log', '.txt', '.syslog', '.err', '.out', '.gz'];
-  const logFiles = [];
 
   dirWatcher.on('add', (fp) => {
     const ext = path.extname(fp).toLowerCase();
-    if (logExts.includes(ext)) {
-      logFiles.push(fp);
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('dir-file-found', { path: fp, name: path.basename(fp) });
-      }
+    if (logExts.includes(ext) && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('dir-file-found', { path: fp, name: path.basename(fp) });
     }
   });
+  dirWatcher.on('error', () => { /* unreadable subfolder etc. */ });
 
-  return logFiles;
+  return true;
 }
 
 // ============================================================
@@ -455,17 +322,16 @@ async function exportData(entries, format) {
     defaultPath: `loglab-export.${ext}`,
     filters: [{ name: format.toUpperCase(), extensions: [ext] }],
   });
-  if (result.canceled) return false;
+  if (result.canceled || !result.filePath) return false;
 
-  if (format === 'json') {
-    fs.writeFileSync(result.filePath, JSON.stringify(entries, null, 2));
-  } else {
-    const header = 'Line,Level,Timestamp,Source,Message\n';
-    const rows = entries.map(e => {
-      const msg = (e.message || e.raw || '').replace(/"/g, '""');
-      return `${e.line},"${e.level}","${e.timestamp || ''}","${e.source || ''}","${msg}"`;
-    }).join('\n');
-    fs.writeFileSync(result.filePath, header + rows);
+  try {
+    if (format === 'json') {
+      fs.writeFileSync(result.filePath, JSON.stringify(entries, null, 2));
+    } else {
+      fs.writeFileSync(result.filePath, toCSV(entries));
+    }
+  } catch (err) {
+    return { error: err.message };
   }
   return true;
 }
@@ -473,55 +339,76 @@ async function exportData(entries, format) {
 // ============================================================
 // IPC Handlers
 // ============================================================
+// Only the app's own main frame may call into the main process.
+function handle(channel, fn) {
+  ipcMain.handle(channel, (e, ...args) => {
+    if (!mainWindow || mainWindow.isDestroyed() || e.sender.id !== mainWindow.webContents.id || !e.senderFrame || e.senderFrame.parent) {
+      throw new Error('Untrusted IPC sender');
+    }
+    return fn(e, ...args);
+  });
+}
+
+const isStr = (v) => typeof v === 'string' && v.length > 0;
+
 function setupIPC() {
   // File operations
-  ipcMain.handle('open-file-dialog', async () => openFileDialog());
-  ipcMain.handle('open-dir-dialog', async () => openDirDialog());
+  handle('open-file-dialog', async () => openFileDialog());
+  handle('open-dir-dialog', async () => openDirDialog());
 
-  ipcMain.handle('read-log-file', async (_e, filePath, maxLines) => {
+  handle('read-log-file', async (_e, filePath, maxLines) => {
+    if (!isStr(filePath)) return { error: 'No file path' };
     try {
-      const entries = await readLogFile(filePath, maxLines);
+      const { entries, lineCount, truncated, endOffset, encoding } = await readLogFile(filePath, maxLines);
       const stats = computeStats(entries);
       const fileStats = getFileStats(filePath);
-      return { entries, stats, fileStats, name: path.basename(filePath), path: filePath };
+      return { entries, stats, fileStats, name: path.basename(filePath), path: filePath, lineCount, truncated, endOffset, encoding };
     } catch (err) {
       return { error: err.message };
     }
   });
 
-  ipcMain.handle('get-file-stats', (_e, filePath) => getFileStats(filePath));
+  handle('get-file-stats', (_e, filePath) => getFileStats(filePath));
 
   // Tail mode
-  ipcMain.handle('start-tail', (_e, filePath, tabId) => {
-    startTailing(filePath, tabId);
-    return true;
+  handle('start-tail', (_e, filePath, tabId, opts) => {
+    if (!isStr(filePath) || !isStr(tabId)) return { error: 'Invalid tail request' };
+    return startTailing(filePath, tabId, opts);
   });
 
-  ipcMain.handle('stop-tail', (_e, tabId) => {
+  handle('stop-tail', (_e, tabId) => {
     stopTailing(tabId);
     return true;
   });
 
   // Update stats incrementally (called from renderer after tail data arrives)
-  ipcMain.handle('update-stats', (_e, existingStats, newEntries) => {
+  handle('update-stats', (_e, existingStats, newEntries) => {
     return updateStats(existingStats, newEntries);
   });
 
   // Directory watching
-  ipcMain.handle('watch-directory', (_e, dirPath) => {
+  handle('watch-directory', (_e, dirPath) => {
+    if (!isStr(dirPath)) return false;
     return watchDirectory(dirPath);
   });
 
+  // Files passed on the command line (file association / "Open with")
+  handle('take-pending-files', () => {
+    const files = pendingOpenFiles;
+    pendingOpenFiles = [];
+    return files;
+  });
+
   // Export
-  ipcMain.handle('export-data', async (_e, entries, format) => exportData(entries, format));
+  handle('export-data', async (_e, entries, format) => exportData(entries, format));
 
   // Bookmarks (stored in prefs)
-  ipcMain.handle('get-bookmarks', (_e, filePath) => {
+  handle('get-bookmarks', (_e, filePath) => {
     const prefs = loadPrefs();
     return (prefs.bookmarks && prefs.bookmarks[filePath]) || [];
   });
 
-  ipcMain.handle('set-bookmarks', (_e, filePath, bookmarks) => {
+  handle('set-bookmarks', (_e, filePath, bookmarks) => {
     const prefs = loadPrefs();
     if (!prefs.bookmarks) prefs.bookmarks = {};
     prefs.bookmarks[filePath] = bookmarks;
@@ -530,12 +417,12 @@ function setupIPC() {
   });
 
   // Recent files
-  ipcMain.handle('get-recent-files', () => {
+  handle('get-recent-files', () => {
     const prefs = loadPrefs();
     return prefs.recentFiles || [];
   });
 
-  ipcMain.handle('add-recent-file', (_e, filePath) => {
+  handle('add-recent-file', (_e, filePath) => {
     const prefs = loadPrefs();
     if (!prefs.recentFiles) prefs.recentFiles = [];
     prefs.recentFiles = prefs.recentFiles.filter(f => f !== filePath);
@@ -546,11 +433,11 @@ function setupIPC() {
   });
 
   // Settings / Preferences
-  ipcMain.handle('get-prefs', () => {
+  handle('get-prefs', () => {
     return loadPrefs();
   });
 
-  ipcMain.handle('save-prefs', (_e, newPrefs) => {
+  handle('save-prefs', (_e, newPrefs) => {
     const prefs = loadPrefs();
     // Merge (preserve bookmarks and recentFiles from disk, update settings keys)
     const merged = Object.assign({}, prefs, newPrefs);
@@ -559,17 +446,17 @@ function setupIPC() {
   });
 
   // Window controls
-  ipcMain.handle('minimize-window', () => { if (mainWindow) mainWindow.minimize(); });
-  ipcMain.handle('maximize-window', () => {
+  handle('minimize-window', () => { if (mainWindow) mainWindow.minimize(); });
+  handle('maximize-window', () => {
     if (!mainWindow) return;
     if (mainWindow.isMaximized()) mainWindow.unmaximize(); else mainWindow.maximize();
   });
-  ipcMain.handle('close-window', () => { if (mainWindow) mainWindow.hide(); });
-  ipcMain.handle('is-maximized', () => mainWindow ? mainWindow.isMaximized() : false);
+  handle('close-window', () => { if (mainWindow) mainWindow.hide(); });
+  handle('is-maximized', () => mainWindow ? mainWindow.isMaximized() : false);
 
   // Reveal in explorer
-  ipcMain.handle('reveal-in-explorer', (_e, filePath) => {
-    shell.showItemInFolder(filePath);
+  handle('reveal-in-explorer', (_e, filePath) => {
+    if (isStr(filePath)) shell.showItemInFolder(filePath);
   });
 }
 
@@ -578,14 +465,41 @@ function setupIPC() {
 // ============================================================
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
+// Existing regular files among command-line arguments.
+function filesFromArgv(argv, cwd) {
+  const out = [];
+  for (const arg of argv.slice(1)) {
+    if (!arg || arg.startsWith('-')) continue;
+    const p = path.resolve(cwd || process.cwd(), arg);
+    try { if (fs.statSync(p).isFile()) out.push(p); } catch { /* not a file */ }
+  }
+  return out;
+}
+
+function openFilesInWindow(files) {
+  if (files.length === 0) return;
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isLoading()) {
+    mainWindow.webContents.send('open-files', files);
+  } else {
+    pendingOpenFiles.push(...files);
+  }
+}
+
 // ============================================================
 // Lifecycle
 // ============================================================
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) { app.quit(); } else {
-  app.on('second-instance', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
+  pendingOpenFiles = filesFromArgv(process.argv);
+
+  app.on('second-instance', (_e, argv, cwd) => {
+    if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+    openFilesInWindow(filesFromArgv(argv, cwd));
+  });
 
   app.whenReady().then(() => {
+    // The UI needs no camera, notifications, etc.
+    session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
     setupIPC();
     createWindow();
     createTray();
@@ -596,8 +510,7 @@ if (!gotLock) { app.quit(); } else {
   app.on('before-quit', () => { isQuitting = true; });
   app.on('will-quit', () => {
     globalShortcut.unregisterAll();
-    for (const [tabId] of fileWatchers) stopTailing(tabId);
-    if (dirWatcher) dirWatcher.close();
+    stopAllWatchers();
   });
   app.on('window-all-closed', (e) => e.preventDefault());
 }

@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('loglab', {
   // File operations
@@ -8,9 +8,10 @@ contextBridge.exposeInMainWorld('loglab', {
   getFileStats: (path) => ipcRenderer.invoke('get-file-stats', path),
 
   // Tail mode
-  startTail: (path, tabId) => ipcRenderer.invoke('start-tail', path, tabId),
+  startTail: (path, tabId, opts) => ipcRenderer.invoke('start-tail', path, tabId, opts),
   stopTail: (tabId) => ipcRenderer.invoke('stop-tail', tabId),
   onTailData: (cb) => ipcRenderer.on('tail-data', (_e, d) => cb(d)),
+  onTailError: (cb) => ipcRenderer.on('tail-error', (_e, d) => cb(d)),
 
   // Stats update (for tail mode - runs in main process)
   updateStats: (existingStats, newEntries) => ipcRenderer.invoke('update-stats', existingStats, newEntries),
@@ -42,4 +43,10 @@ contextBridge.exposeInMainWorld('loglab', {
 
   // File system
   revealInExplorer: (path) => ipcRenderer.invoke('reveal-in-explorer', path),
+  // File.path was removed in Electron 32; dropped files need webUtils.
+  getPathForFile: (file) => webUtils.getPathForFile(file),
+
+  // Files from the command line / file association
+  takePendingFiles: () => ipcRenderer.invoke('take-pending-files'),
+  onOpenFiles: (cb) => ipcRenderer.on('open-files', (_e, files) => cb(files)),
 });
