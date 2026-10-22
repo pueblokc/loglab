@@ -15,20 +15,34 @@
       "output": "dist"
     },
     "win": {
-      "target": ["nsis", "portable"]
+      "target": [
+        "nsis",
+        "portable"
+      ]
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
     },
     "fileAssociations": [
-      { "ext": "log", "name": "Log File", "role": "Viewer" },
-      { "ext": "txt", "name": "Text File", "role": "Viewer" }
+      {
+        "ext": "log",
+        "name": "Log File",
+        "role": "Viewer"
+      },
+      {
+        "ext": "txt",
+        "name": "Text File",
+        "role": "Viewer"
+      }
     ]
   },
   "devDependencies": {
-    "electron": "^34.0.0",
-    "electron-builder": "^25.1.8"
+    "@eslint/js": "^9.39.5",
+    "electron": "^44.9.3",
+    "electron-builder": "^26.15.3",
+    "eslint": "^9.39.5",
+    "globals": "^16.5.0"
   },
   "dependencies": {
     "chokidar": "^4.0.0"
